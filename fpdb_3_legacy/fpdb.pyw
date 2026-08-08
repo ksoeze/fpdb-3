@@ -197,6 +197,17 @@ def _resolve_version() -> str:
 VERSION = _resolve_version()
 
 
+# Personal deviation from upstream, not for a pull request.
+#
+# Upstream makes the main window frameless everywhere except macOS and draws a
+# replacement title bar. Under xfwm4 that costs the things the window manager
+# would otherwise provide for free -- alt-drag, snapping, edge resize, keyboard
+# move, the window menu -- in exchange for a title bar whose only affordance is
+# a hand-written drag handler. Keep the native frame instead; the replacement
+# title bar is then not built at all, so it cannot show up as a second row.
+USE_FRAMELESS_WINDOW = False
+
+
 class fpdb(QMainWindow):
     config: Any
     db: Any
@@ -2145,8 +2156,11 @@ class fpdb(QMainWindow):
             log.exception(f"Error changing theme: {e}")
 
     def update_title_bar_theme(self) -> None:
-        # Apply the stylesheet to the custom title bar
-        self.custom_title_bar.update_theme()
+        # Apply the stylesheet to the custom title bar, if there is one: with
+        # native decorations the replacement title bar is never constructed.
+        title_bar = getattr(self, "custom_title_bar", None)
+        if title_bar is not None:
+            title_bar.update_theme()
 
     def close_tab(self, index) -> None:
         item = self.nb.widget(index)
@@ -2172,9 +2186,7 @@ class fpdb(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        if sys.platform == "darwin":
-            pass
-        else:
+        if sys.platform != "darwin" and USE_FRAMELESS_WINDOW:
             self.setWindowFlags(Qt.FramelessWindowHint)
         cards = os.path.join(Configuration.GRAPHICS_PATH, "tribal.jpg")
         if os.path.exists(cards):
@@ -2225,9 +2237,7 @@ class fpdb(QMainWindow):
         defy = min(sg.height(), defy)
         self.resize(defx, defy)
 
-        if sys.platform == "darwin":
-            pass
-        else:
+        if sys.platform != "darwin" and USE_FRAMELESS_WINDOW:
             # Create custom title bar
             self.custom_title_bar = CustomTitleBar(self)
         # Create central widget and layout
@@ -2248,7 +2258,8 @@ class fpdb(QMainWindow):
             # line, and the row users tried to drag was the menu bar, which has
             # no move handler. Add the menu bar as an ordinary second row so the
             # replacement title bar really is the topmost one.
-            self.central_layout.addWidget(self.custom_title_bar)
+            if USE_FRAMELESS_WINDOW:
+                self.central_layout.addWidget(self.custom_title_bar)
             self.menu_bar = self.menuBar()
             self.central_layout.addWidget(self.menu_bar)
 
