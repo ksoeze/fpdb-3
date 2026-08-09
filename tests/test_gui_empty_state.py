@@ -160,6 +160,8 @@ def test_ring_profit_graph_reports_an_unticked_site(empty_db, monkeypatch) -> No
             getGames=list,
             getCurrencies=list,
             getGraphOps=list,
+            # No site ticked, so the hero resolver has nothing to walk.
+            resolve_hero_player_ids=lambda *_args, **_kwargs: ([], [], []),
         ),
     )
 
