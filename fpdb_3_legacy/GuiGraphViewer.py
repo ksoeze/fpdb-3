@@ -120,8 +120,6 @@ class GuiGraphViewer(QSplitter):
     def generateGraph(self, widget) -> None:
         self.clearGraphData()
 
-        sitenos = []
-        playerids = []
         # winnings = []
         sites = self.filters.getSites()
         heroes = self.filters.getHeroes()
@@ -132,34 +130,15 @@ class GuiGraphViewer(QSplitter):
         graphops = self.filters.getGraphOps()
         display_currency = currencies[0] if currencies else "USD"
         display_in = currency_symbol(display_currency) if "$" in graphops else "BB"
-        names = ""
 
         log.debug(
             f"GuiGraphViewer.generateGraph called. Sites selected: {sites}, Heroes config: {heroes}, siteids: {siteids}, limits: {limits}, games: {games}, currencies: {currencies}, graphops: {graphops}"
         )
 
-        for site in sites:
-            _hname = heroes.get(site, "")
-            if not _hname:
-                continue
-            # Plot the hero the user selected, resolved variant-aware:
-            # get_player_id maps a "PokerStars" selection to the hero's
-            # "PokerStars.FR" account, so data imported under a site skin still
-            # shows. Fall back to the site's hero-flagged players if unresolved.
-            result = self.db.get_player_id(self.conf, site, _hname)
-            pids = [int(result)] if result is not None else self.db.get_hero_player_ids(site)
-            for pid in pids:
-                if pid not in playerids:
-                    playerids.append(pid)
-                    pname = self.db.get_player_name_by_id(pid) or _hname
-                    names = names + "\n" + pname + " on " + site
-
-                    actual_site_id = self.db.get_player_site_id(pid)
-                    if actual_site_id is not None:
-                        sitenos.append(actual_site_id)
-                        log.debug(f"GuiGraphViewer: Using resolved actual siteId {actual_site_id} for hero '{pname}'")
-                    else:
-                        sitenos.append(siteids[site])
+        # Handles both a single "<hero> on <site>" selection and a [Profile]
+        # spanning several aliases/rooms.
+        playerids, sitenos, hero_names = self.filters.resolve_hero_player_ids(sites, siteids)
+        names = "".join(f"\n{name}" for name in hero_names)
 
         log.debug(f"GuiGraphViewer.generateGraph resolved sitenos: {sitenos}, playerids: {playerids}, names: {names!r}")
 

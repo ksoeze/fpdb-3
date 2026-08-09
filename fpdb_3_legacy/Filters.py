@@ -752,6 +752,71 @@ class Filters(QWidget):
                 return getter().get(data[1])
         return None
 
+    def get_hero_names_for_site(self, sitename: str) -> list[str]:
+        """Return every hero screen name to report on for one site.
+
+        A ``[Profile]`` selection contributes all of that profile's aliases for
+        the site; a plain "<hero> on <site>" selection contributes just that
+        name. Empty when the selection covers no alias on this site.
+        """
+        profile = self.get_selected_hero_profile()
+        if profile is not None:
+            by_site = profile.aliases_by_site()
+            if sitename in by_site:
+                return list(by_site[sitename])
+            # The profile stores whatever site name the config used, which need
+            # not match the filter's spelling ("PokerStars.FR" vs "PokerStars").
+            wanted = sitename.casefold()
+            for site, aliases in by_site.items():
+                if site.casefold() == wanted:
+                    return list(aliases)
+            return []
+        hero = self.getHeroes().get(sitename, "")
+        return [hero] if hero else []
+
+    def resolve_hero_player_ids(self, sites=None, siteids=None) -> tuple[list[int], list[int], list[str]]:
+        """Resolve the Heroes selection into (playerids, sitenos, display names).
+
+        Every report used to inline this loop over ``getHeroes()`` alone, which
+        returns {} for a ``[Profile]`` selection -- so selecting a profile left
+        them with no player at all and they rendered empty. Resolving both kinds
+        of selection in one place keeps that from drifting apart again.
+        """
+        sites = self.getSites() if sites is None else sites
+        siteids = self.getSiteIds() if siteids is None else siteids
+        by_profile = self.get_selected_hero_profile() is not None
+
+        playerids: list[int] = []
+        sitenos: list[int] = []
+        names: list[str] = []
+
+        for site in sites:
+            for hname in self.get_hero_names_for_site(site):
+                # Resolved variant-aware: get_player_id maps a "PokerStars"
+                # selection to the hero's "PokerStars.FR" account, so data
+                # imported under a site skin still shows.
+                result = self.db.get_player_id(self.conf, site, hname)
+                if result is not None:
+                    pids = [int(result)]
+                elif by_profile:
+                    # A profile names its aliases explicitly. One that is absent
+                    # from the database (never imported, or not imported yet) is
+                    # simply skipped -- widening to every hero-flagged player on
+                    # the site would report on identities the profile omits.
+                    log.debug("Hero alias '%s' on %s is not in the database, skipping", hname, site)
+                    continue
+                else:
+                    pids = self.db.get_hero_player_ids(site)
+                for pid in pids:
+                    if pid in playerids:
+                        continue
+                    playerids.append(pid)
+                    names.append(f"{self.db.get_player_name_by_id(pid) or hname} on {site}")
+                    actual_site_id = self.db.get_player_site_id(pid)
+                    sitenos.append(actual_site_id if actual_site_id is not None else siteids[site])
+
+        return playerids, sitenos, names
+
     def get_hero_for_site(self, sitename: str, hand: Any = None) -> str | None:
         """Resolve hero name for the given sitename, mapping site variants if needed.
 

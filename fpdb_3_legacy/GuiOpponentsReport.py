@@ -505,35 +505,15 @@ class GuiOpponentsReport(QSplitter):
     def fillStatsFrame(self) -> None:
         startTime = time()
         sites = self.filters.getSites()
-        heroes = self.filters.getHeroes()
         siteids = self.filters.getSiteIds()
         limits = self.filters.getLimits()
         dates = self.filters.getDates()
         games = self.filters.getGames()
         currencies = self.filters.getCurrencies()
 
-        sitenos = []
-        playerids = []
-
-        for site in sites:
-            hname = heroes.get(site, "")
-            if not hname:
-                log.info(f"fillStatsFrame: site '{site}' has no selected hero, skipping")
-                continue
-            # Plot the hero the user selected, resolved variant-aware:
-            # get_player_id maps a "PokerStars" selection to the hero's
-            # "PokerStars.FR" account, so data imported under a site skin still
-            # shows. Fall back to the site's hero-flagged players if unresolved.
-            result = self.db.get_player_id(self.conf, site, hname)
-            pids = [int(result)] if result is not None else self.db.get_hero_player_ids(site)
-            for pid in pids:
-                if pid not in playerids:
-                    playerids.append(pid)
-                    actual_site_id = self.db.get_player_site_id(pid)
-                    if actual_site_id is not None:
-                        sitenos.append(actual_site_id)
-                    else:
-                        sitenos.append(siteids[site])
+        # Handles both a single "<hero> on <site>" selection and a [Profile]
+        # spanning several aliases/rooms.
+        playerids, sitenos, _hero_names = self.filters.resolve_hero_player_ids(sites, siteids)
 
         missing = gui_empty_state.missing_filter_reason(sites=sites, playerids=playerids, limits=limits)
         if missing is not None:

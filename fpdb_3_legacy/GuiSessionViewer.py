@@ -181,34 +181,14 @@ class GuiSessionViewer(QSplitter):
         currencies = self.filters.getCurrencies()
         limits = self.filters.getLimits()
         seats = self.filters.getSeats()
-        sitenos = []
-        playerids = []
 
         log.warning(
             f"GuiSessionViewer.fillStatsFrame called. sites: {sites}, heroes: {heroes}, siteids: {siteids}, games: {games}, currencies: {currencies}, limits: {limits}, seats: {seats}"
         )
 
-        for site in sites:
-            _hname = heroes.get(site, "")
-            if not _hname:
-                continue
-            # Plot the hero the user selected, resolved variant-aware:
-            # get_player_id maps a "PokerStars" selection to the hero's
-            # "PokerStars.FR" account, so data imported under a site skin still
-            # shows. Fall back to the site's hero-flagged players if unresolved.
-            result = self.db.get_player_id(self.conf, site, _hname)
-            pids = [int(result)] if result is not None else self.db.get_hero_player_ids(site)
-            for pid in pids:
-                if pid not in playerids:
-                    playerids.append(pid)
-                    actual_site_id = self.db.get_player_site_id(pid)
-                    if actual_site_id is not None:
-                        sitenos.append(actual_site_id)
-                        log.warning(
-                            f"GuiSessionViewer.fillStatsFrame: Using resolved actual siteId {actual_site_id} for hero playerId {pid}"
-                        )
-                    else:
-                        sitenos.append(siteids[site])
+        # Handles both a single "<hero> on <site>" selection and a [Profile]
+        # spanning several aliases/rooms.
+        playerids, sitenos, _hero_names = self.filters.resolve_hero_player_ids(sites, siteids)
 
         log.warning(f"GuiSessionViewer.fillStatsFrame resolved sitenos: {sitenos}, playerids: {playerids}")
 
@@ -455,9 +435,6 @@ class GuiSessionViewer(QSplitter):
 
     def generateGraph(self, quotes, _currencies: list[str] | None = None) -> None:
         self.clearGraphData()
-        sitenos = []
-        playerids = []
-
         sites = self.filters.getSites()
         heroes = self.filters.getHeroes()
         siteids = self.filters.getSiteIds()
@@ -467,32 +444,10 @@ class GuiSessionViewer(QSplitter):
             f"GuiSessionViewer.generateGraph called. quotes count: {len(quotes)}, sites: {sites}, heroes: {heroes}"
         )
 
-        names = ""
-
-        for site in sites:
-            _hname = heroes.get(site, "")
-            if not _hname:
-                continue
-            # Plot the hero the user selected, resolved variant-aware:
-            # get_player_id maps a "PokerStars" selection to the hero's
-            # "PokerStars.FR" account, so data imported under a site skin still
-            # shows. Fall back to the site's hero-flagged players if unresolved.
-            result = self.db.get_player_id(self.conf, site, _hname)
-            pids = [int(result)] if result is not None else self.db.get_hero_player_ids(site)
-            for pid in pids:
-                if pid not in playerids:
-                    playerids.append(pid)
-                    pname = self.db.get_player_name_by_id(pid) or _hname
-                    names = names + "\n" + pname + " on " + site
-
-                    actual_site_id = self.db.get_player_site_id(pid)
-                    if actual_site_id is not None:
-                        sitenos.append(actual_site_id)
-                        log.warning(
-                            f"GuiSessionViewer.generateGraph: Using resolved actual siteId {actual_site_id} for hero '{pname}'"
-                        )
-                    else:
-                        sitenos.append(siteids[site])
+        # Handles both a single "<hero> on <site>" selection and a [Profile]
+        # spanning several aliases/rooms.
+        playerids, sitenos, hero_names = self.filters.resolve_hero_player_ids(sites, siteids)
+        names = "".join(f"\n{name}" for name in hero_names)
 
         log.warning(f"GuiSessionViewer.generateGraph resolved sitenos: {sitenos}, playerids: {playerids}")
 
