@@ -24,9 +24,12 @@ import math
 
 #    Standard Library modules
 import os
+import queue
 import re
 import sys
+import threading
 import traceback
+import weakref
 from datetime import datetime, timedelta
 from decimal import Decimal
 from importlib import import_module
@@ -37,6 +40,8 @@ import pytz
 from cachetools import TTLCache
 
 from fpdb_3_legacy import SQL, Card, Configuration, db_profile
+from fpdb_3_legacy.action_enum_stats import CACHE_KEYS as ACTION_ENUM_CACHE_KEYS
+from fpdb_3_legacy.action_enum_stats import SITUATIONS as ACTION_ENUM_SITUATIONS
 from fpdb_3_legacy.database_aof import DatabaseAofMixin
 from fpdb_3_legacy.database_auto_notes import DatabaseAutoNotesMixin
 from fpdb_3_legacy.database_bulk_import import DatabaseBulkImportMixin
@@ -218,6 +223,22 @@ class Database(
     PGSQL = 3
     SQLITE = 4
 
+    # The semaphore is global on purpose: it bounds how many worker
+    # connections this *process* holds open at once, which is a limit about
+    # the process rather than about any one database. Idle connections are
+    # counted separately and evicted before opening a connection for another
+    # database, so the active limit and the total open-connection limit agree.
+    _worker_conn_semaphore = threading.Semaphore(4)
+    _worker_pool_lock = threading.Lock()
+    _worker_idle_connections = 0
+    _worker_idle_limit = 4
+    _worker_pools: weakref.WeakSet[Any] = weakref.WeakSet()
+    # A worker may still be inside ``worker_connection`` after its database
+    # tab has retired the idle pool.  Keep that identity briefly so its return
+    # path closes the borrowed connection instead of enqueueing it into an
+    # unreachable queue.
+    _worker_retired_pools: weakref.WeakSet[Any] = weakref.WeakSet()
+
     hero_hudstart_def = "1999-12-31"  # default for length of Hero's stats in HUD
     villain_hudstart_def = "1999-12-31"  # default for length of Villain's stats in HUD
 
@@ -275,6 +296,10 @@ class Database(
         # backend-defined runtime interface.
         self.connection: Any = None
         self.cursor: Any = None
+        self._worker_conn_pool: queue.Queue[Any] = queue.Queue()
+        with Database._worker_pool_lock:
+            Database._worker_pools.add(self._worker_conn_pool)
+            Database._worker_retired_pools.discard(self._worker_conn_pool)
         self.__connected = False
         self.wrongDbVersion = False
         self.settings = {}
@@ -425,6 +450,7 @@ class Database(
             "Gametypes",
             "Hands",
             "Boards",
+            "BoardFeatures",
             "HandsActions",
             "HandsPlayers",
             "HandsStove",
@@ -715,7 +741,8 @@ class Database(
             settings = self.cursor.fetchone()
             if settings[0] != DB_VERSION:
                 log.error(
-                    f"Outdated or too new database version ({settings[0]}). Please recreate tables.",
+                    f"Outdated or too new database version ({settings[0]}). Back up the database first: "
+                    "recreating tables deletes all imported hands and statistics and requires reimport.",
                 )
                 self.wrongDbVersion = True
         except Exception:  # intentional broad catch: settings-table read failure triggers cross-backend table recreate
@@ -797,11 +824,231 @@ class Database(
             self.connection.ping(True)
         return self.connection.cursor()
 
+    @contextlib.contextmanager
+    def worker_connection(self):
+        """Context manager for a dedicated worker connection from a bounded pool.
+
+        Limits the number of concurrent connections to avoid hitting
+        max_connections on PostgreSQL (and MySQL).
+
+        The connection is always returned to the pool with its transaction
+        ended. Workers only read, but a read still opens a transaction, and one
+        that is never ended does two things: it leaves the connection in ``idle
+        in transaction`` holding read locks for the life of the process --
+        pinning autovacuum off Hands and HandsPlayers, and standing in the way
+        of anything needing a stronger lock (#249, #271) -- and, when the query
+        failed, it hands the next borrower a connection whose transaction is
+        already aborted, so every later query on it fails too.
+        """
+        with Database._worker_pool_lock:
+            Database._worker_pools.add(self._worker_conn_pool)
+            Database._worker_retired_pools.discard(self._worker_conn_pool)
+        conn = None
+        slot_acquired = False
+        try:
+            # The global semaphore bounds checked-out connections, not just
+            # newly created ones. Reusing an idle connection must consume the
+            # same process-wide capacity or several database instances can
+            # exceed the intended four-worker connection bound.
+            self._worker_conn_semaphore.acquire()
+            slot_acquired = True
+            try:
+                with Database._worker_pool_lock:
+                    conn = self._worker_conn_pool.get_nowait()
+                    Database._worker_idle_connections -= 1
+            except queue.Empty:
+                # An idle connection owned by another Database still occupies
+                # a process-wide slot. Evict stale idle pools before waiting
+                # for the active-worker slot, so a newly opened study cannot
+                # be starved by connections retained by another study.
+                self._evict_idle_worker_connections(exclude=self._worker_conn_pool)
+                conn = self._create_new_worker_connection()
+
+            yield conn
+        finally:
+            self._return_worker_connection(conn)
+            if slot_acquired:
+                self._worker_conn_semaphore.release()
+
+    @classmethod
+    def _evict_idle_worker_connections(cls, exclude=None) -> None:
+        """Drop idle connections from other pools before opening a new one."""
+        with cls._worker_pool_lock:
+            for pool in tuple(cls._worker_pools):
+                if pool is exclude:
+                    continue
+                while True:
+                    try:
+                        conn = pool.get_nowait()
+                    except queue.Empty:
+                        break
+                    cls._worker_idle_connections -= 1
+                    with contextlib.suppress(Exception):
+                        conn.close()
+
+    def _return_worker_connection(self, conn) -> None:
+        """Put a worker connection back, with nothing left open on it.
+
+        A connection whose rollback fails is beyond reuse, so it is dropped
+        rather than pooled; the next borrower simply opens a fresh one.
+        """
+        if conn is None:
+            return
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 - a connection that cannot roll back is not reusable
+            log.debug("Discarding a worker connection that could not be rolled back", exc_info=True)
+            with contextlib.suppress(Exception):
+                conn.close()
+            return
+        with Database._worker_pool_lock:
+            retired = self._worker_conn_pool in Database._worker_retired_pools
+            registered = self._worker_conn_pool in Database._worker_pools
+            if retired:
+                close_connection = True
+            elif registered and Database._worker_idle_connections >= Database._worker_idle_limit:
+                close_connection = True
+            else:
+                close_connection = False
+                self._worker_conn_pool.put(conn)
+                if registered:
+                    Database._worker_idle_connections += 1
+        if close_connection:
+            with contextlib.suppress(Exception):
+                conn.close()
+
+    def _create_new_worker_connection(self):
+        """Open a dedicated connection for a background worker thread.
+
+        Returns None when no dedicated connection can be built (e.g. SQLite
+        ``:memory:``), in which case the worker falls back to the shared
+        connection.
+
+        No DBAPI driver used here allows two threads to drive one connection
+        concurrently without an application-level lock:
+
+        - sqlite3 (check_same_thread=False) serializes calls but interleaves
+          execute/fetchall pairs from the GUI thread and DbWorker threads,
+          which deadlocks the GUI on macOS. WAL mode makes one read connection
+          per thread safe.
+        - psycopg3 is thread-safe at connection level but NOT at cursor level:
+          two threads sharing one connection can interleave execute/fetchall.
+        - MySQLdb/pymysql has threadsafety=1: connections must NOT be shared
+          across threads at all.
+
+        The returned connection is intentionally NOT passed through
+        db_profile.wrap_connection: profiling is single-process bookkeeping and
+        worker round trips stay attributed to the main connection.
+        """
+        if self.backend == self.SQLITE:
+            return self._create_sqlite_worker_connection()
+        if self.backend == self.PGSQL:
+            return self._create_postgresql_worker_connection()
+        if self.backend == self.MYSQL_INNODB:
+            return self._create_mysql_worker_connection()
+        return None
+
+    def _create_sqlite_worker_connection(self):
+        """Dedicated SQLite connection for a worker thread (WAL mode)."""
+        if not self.db_path or self.db_path == ":memory:":
+            return None
+        import sqlite3
+
+        conn = sqlite3.connect(
+            self.db_path,
+            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+            timeout=60.0,
+            check_same_thread=False,
+        )
+        conn.execute("PRAGMA busy_timeout=60000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=0")
+        conn.create_function("floor", 1, math.floor)
+        conn.create_function("sqrt", 1, math.sqrt)
+        tmp = sqlitemath()
+        conn.create_function("mod", 2, tmp.mod)
+        if use_numpy:
+            conn.create_aggregate("variance", 1, VARIANCE)
+        return conn
+
+    def _create_postgresql_worker_connection(self):
+        """Dedicated PostgreSQL connection for a worker thread."""
+        import psycopg
+
+        kwargs = {"dbname": self.database, **PG_NETWORK_KWARGS}
+        if self.host not in ("localhost", "127.0.0.1"):
+            kwargs.update({"host": self.host, "port": self.port, "user": self.user, "password": self.password})
+        try:
+            return psycopg.connect(**kwargs)
+        except psycopg.OperationalError:
+            # Local peer connection failed; retry with explicit credentials.
+            return psycopg.connect(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                password=self.password,
+                dbname=self.database,
+                **PG_NETWORK_KWARGS,
+            )
+
+    def _create_mysql_worker_connection(self):
+        """Dedicated MySQL connection for a worker thread."""
+        try:
+            import MySQLdb
+        except ImportError:
+            import pymysql
+
+            pymysql.install_as_MySQLdb()
+            import MySQLdb
+
+        kwargs = {
+            "host": self.host,
+            "user": self.user,
+            "passwd": self.password,
+            "db": self.database,
+            "charset": "utf8",
+            "use_unicode": True,
+            **MYSQL_NETWORK_KWARGS,
+        }
+        if self.port:
+            kwargs["port"] = int(self.port)
+        return MySQLdb.connect(**kwargs)
+
     def close_connection(self) -> None:
         if getattr(self, "connection", None):
             self.connection.close()
             self.connection = None
         self.__connected = False
+
+    def close_worker_pool(self) -> None:
+        """Close the connections idling in this database's worker pool.
+
+        An instance method since the pool became one: closing "the" pool from
+        the class would have had to pick a database, and there is more than
+        one only because they are different databases.
+        """
+        pool = getattr(self, "_worker_conn_pool", None)
+        if pool is None:
+            return
+        retired_connections = []
+        # Retire the identity before draining it, atomically with the queue
+        # transition. A worker that returns between the final empty check and
+        # the retirement marker must not put an untracked connection back.
+        with Database._worker_pool_lock:
+            Database._worker_pools.discard(pool)
+            Database._worker_retired_pools.add(pool)
+        while True:
+            try:
+                with Database._worker_pool_lock:
+                    conn = pool.get_nowait()
+                    Database._worker_idle_connections -= 1
+            except queue.Empty:
+                break
+            if conn is not None:
+                retired_connections.append(conn)
+        for conn in retired_connections:
+            with contextlib.suppress(Exception):
+                conn.close()
 
     def _close_cursor_quietly(self) -> None:
         cursor = getattr(self, "cursor", None)
@@ -817,6 +1064,7 @@ class Database(
         # database closed once already has no connection to commit, and calling
         # disconnect twice -- which shutdown paths do -- should be a no-op
         # rather than an AttributeError on the way out.
+        self.close_worker_pool()
         if self.connection is not None:
             if due_to_error:
                 self.connection.rollback()
@@ -848,6 +1096,7 @@ class Database(
         what a broken socket cannot do: the recovery path would raise inside its
         own cleanup and never get as far as reconnecting.
         """
+        self.close_worker_pool()
         self._close_cursor_quietly()
         with contextlib.suppress(Exception):
             if self.connection is not None:
@@ -1065,6 +1314,28 @@ class Database(
         }
         self._gameinfo_cache[hand_id] = gameinfo
         return gameinfo
+
+    def get_last_gametype_id_for_table(self, site_name, table_name):
+        """Return the gametypeId this table last dealt, or None.
+
+        A Fast-Fold HUD built from the client log has no hand of its own to
+        take a gametypeId from -- the log names the table seconds to minutes
+        before the hand history arrives. Without one the statistics query is
+        skipped entirely and the first hand of every table shows empty blocks.
+        The pool's own last imported hand settles it, and a pool does not
+        change what it deals.
+
+        Takes the site's name rather than its id because the id is itself
+        learned from an imported hand, which is the thing missing here.
+        """
+        if not site_name or not table_name:
+            return None
+        cursor = self.connection.cursor()
+        query = self.sql.query["get_last_gametype_for_table"]
+        query = query.replace("%s", self.sql.query["placeholder"])
+        cursor.execute(query, (site_name, table_name))
+        row = cursor.fetchone()
+        return None if row is None else row[0]
 
     #   Query 'get_hand_info' does not exist, so it seems
     #    def get_hand_info(self, new_hand_id):
@@ -1314,6 +1585,26 @@ class Database(
             query = query.replace("<tourney_group_clause>", "")
         return query
 
+    @staticmethod
+    def _statscache_action_enum_columns(query):
+        """Rebuild the HudCache action-enum counters from the stored enum chars.
+
+        The counters are summed at import, so a rebuild that did not name them
+        would refill HudCache with zeros and drop whatever had accumulated.
+        HandsPlayers keeps the response char per hand, which is enough to count
+        them again from scratch.
+        """
+        insert_columns = "".join(f"\n            ,{key}" for key in ACTION_ENUM_CACHE_KEYS)
+        select_columns = "".join(
+            f"\n                  ,sum(CASE WHEN hp.{situation.enum_key} {test} THEN 1 ELSE 0 END)"
+            for situation in ACTION_ENUM_SITUATIONS
+            for test in ("<> 'N'", "= 'C'", "= 'R'")
+        )
+        return query.replace("<extra_insert_columns>", insert_columns).replace(
+            "<extra_select_columns>",
+            select_columns,
+        )
+
     def _statscache_hudcache(self, query, type):
         """Fill the rebuild template for HudCache, whose key carries the position."""
         insert = """HudCache
@@ -1342,6 +1633,7 @@ class Database(
         query = query.replace("<select>", select)
         query = query.replace("<group>", group)
         query = query.replace("<sessions_join_clause>", "")
+        query = self._statscache_action_enum_columns(query)
 
         if self.build_full_hudcache:
             query = query.replace(
@@ -1499,12 +1791,14 @@ class Database(
 
     def replace_statscache(self, type, table, query):
         if table == "HudCache":
-            return self._statscache_hudcache(query, type)
-        if table == "CardsCache":
-            return self._statscache_cardscache(query, type)
-        if table == "PositionsCache":
-            return self._statscache_positionscache(query, type)
-        return query
+            query = self._statscache_hudcache(query, type)
+        elif table == "CardsCache":
+            query = self._statscache_cardscache(query, type)
+        elif table == "PositionsCache":
+            query = self._statscache_positionscache(query, type)
+        # The action-enum counters are HudCache-only, so every other cache
+        # drops their placeholders rather than inheriting columns it lacks.
+        return query.replace("<extra_insert_columns>", "").replace("<extra_select_columns>", "")
 
     def _rebuild_prepare_heroes(self, h_start, v_start):
         """Resolve the owner's player ids and the two rebuild start dates."""

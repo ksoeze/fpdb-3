@@ -41,11 +41,15 @@ def test_hud_command_uses_pyoxidizer_subcommand(monkeypatch) -> None:
     assert hud_main_command("-x") == [sys.executable, "--hud", "-x"]
 
 
-def test_hud_command_reuses_main_executable_for_pyinstaller_macos(monkeypatch) -> None:
+def test_hud_command_reuses_the_main_executable_on_pyinstaller_macos(monkeypatch, tmp_path) -> None:
+    """One executable gives both processes the same macOS TCC identity."""
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "fpdb"))
 
-    assert hud_main_command("-x") == [sys.executable, HUD_FLAG, "-x"]
+    command = hud_main_command("-x")
+
+    assert command == [str(tmp_path / "fpdb"), HUD_FLAG, "-x"]
 
 
 def test_hud_command_uses_sibling_executable_when_frozen(monkeypatch, tmp_path) -> None:

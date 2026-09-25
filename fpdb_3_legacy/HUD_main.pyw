@@ -5,6 +5,7 @@ Main for FreePokerTools HUD.
 """
 
 import contextlib
+import json
 import os
 import re
 import sys
@@ -24,11 +25,12 @@ if sys.platform.startswith("linux") and os.getenv("FPDB_FORCE_X11") == "1":
 
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from optparse import Values
 from pathlib import Path
 from queue import Empty, Queue
+from types import ModuleType
 from typing import Any
 
 import zmq as _zmq
@@ -39,7 +41,7 @@ zmq: Any = _zmq
 from cachetools import TTLCache
 from PySide6.QtCore import QCoreApplication, QEvent, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QIcon
-from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 from qt_material import apply_stylesheet
 
 from fpdb_3_legacy import Aux_Base, Configuration, Database, Deck, Hud, Options, db_profile
@@ -51,6 +53,7 @@ from fpdb_3_legacy.fast_fold_engine import (
     build_seat_map,
     is_fast_fold_table,
 )
+from fpdb_3_legacy.hud_diagnostics import ROLE_HUD, format_identity, log_process_identity, session_id
 from fpdb_3_legacy.hud_profiles import HudContext, HudPositionScope
 from fpdb_3_legacy.hud_read_service import (
     HudBatchReadRequest,
@@ -60,7 +63,18 @@ from fpdb_3_legacy.hud_read_service import (
     HudReplayDatabase,
     HudTableReadContext,
 )
+from fpdb_3_legacy.hud_window_registry import ClaimOutcome, HudWindowRegistry
 from fpdb_3_legacy.HudStatsPersistence import get_hud_stats_persistence
+from fpdb_3_legacy.Importer import LIVE_ACTION_PREFIX
+from fpdb_3_legacy.interlocks import (
+    HUD_ALREADY_RUNNING_EXIT_CODE,
+    HUD_INSTANCE_LOCK_NAME,
+    HUD_LOCK_UNDETERMINED_EXIT_CODE,
+    LockUndeterminedError,
+    SingleInstanceError,
+    acquire_hud_instance_lock,
+    read_lock_owner,
+)
 from fpdb_3_legacy.loggingFpdb import get_logger, hud_trace
 from fpdb_3_legacy.SmartHudManager import RestartReason, get_smart_hud_manager
 from fpdb_3_legacy.table_info import TableInfo
@@ -109,6 +123,55 @@ class HUDCreationArgs:
     context: HudContext | None = None
     hand_instance: Any = None
     loading: bool = False
+
+
+@dataclass(frozen=True)
+class FastFoldQualification:
+    """What an imported hand says about the window it was played on.
+
+    ``table_no`` is the client's own window index, taken from the log map. It
+    is carried out of qualification rather than recomputed because it is also
+    how an imported hand finds the HUD the live log already built for that
+    window, instead of building a second one.
+    """
+
+    info: TableInfo
+    table_no: str | None
+    site_hand_no: Any
+
+
+@dataclass
+class TableReadState:
+    """What has been learned about reading one table's window.
+
+    Three dictionaries held this, keyed by the table's name, each read and
+    written in a different place and each forgotten -- or not -- on its own. The
+    one that was not forgotten cost a restarted client its seats for a whole
+    session: a pool hands the same name to the next table it opens, so a new HUD
+    inherited "this client will not answer" from a client that had exited.
+
+    One object with one lifetime. Created when a table is first read, dropped
+    whole when it retires, so nothing can be left behind by being overlooked.
+    """
+
+    #: The hand the ring below was read for, the ring itself, and how many reads
+    #: it took. Reset when the hand changes: the seats cannot change within one.
+    hand_id: str | None = None
+    ring: dict[int, str] = field(default_factory=dict)
+    reads: int = 0
+
+    #: Reads in a row that could not seat anyone -- not reads that came back
+    #: empty. A client answering with the hero and one neighbour answers
+    #: non-empty every time and can never be acted on.
+    fruitless: int = 0
+
+    #: Whether the reader has been given up on for this table.
+    gave_up: bool = False
+
+    def start_hand(self, hand_id: str) -> None:
+        """Forget the previous hand's ring, keeping what was learned about the client."""
+        if self.hand_id != hand_id:
+            self.hand_id, self.ring, self.reads = hand_id, {}, 0
 
 
 class ZMQWorker(QThread):
@@ -200,11 +263,37 @@ class HudReadWorker(QThread):
         self.config = config
         self.db_factory = db_factory
         self._requests: Queue[HudBatchReadRequest | None] = Queue()
+        # Newest queued Fast-Fold request id per table, so the worker can drop
+        # the ones already superseded instead of reading for them. See submit().
+        self._latest_fast_fold: dict[str, int] = {}
+        self._latest_lock = threading.Lock()
         self._stopping = threading.Event()
 
     def submit(self, request: HudBatchReadRequest) -> None:
-        """Queue one immutable request from the Qt thread."""
+        """Queue one immutable request from the Qt thread.
+
+        A Fast-Fold request also records itself as its table's newest. The ring
+        grows a player at a time, so several reads for one table can be waiting
+        at once, and every one of them but the last describes a table that has
+        already changed. They used to be executed in full and discarded on
+        arrival by request id -- the database did the work, the GUI threw the
+        answer away. Now the worker drops them before reading.
+        """
+        if isinstance(request, FastFoldStatsRequest):
+            with self._latest_lock:
+                self._latest_fast_fold[request.temp_key] = request.request_id
         self._requests.put(request)
+
+    def _is_superseded(self, request: FastFoldStatsRequest) -> bool:
+        """Whether a newer read for the same table is already queued behind this one."""
+        with self._latest_lock:
+            latest = self._latest_fast_fold.get(request.temp_key)
+        return latest is not None and latest != request.request_id
+
+    def forget_fast_fold_table(self, temp_key: str) -> None:
+        """Drop what is remembered about a table nobody is watching any more."""
+        with self._latest_lock:
+            self._latest_fast_fold.pop(temp_key, None)
 
     @staticmethod
     def _configure_session(database: Database.Database) -> None:
@@ -247,6 +336,18 @@ class HudReadWorker(QThread):
             if request.hand_id is not None:
                 info = database.get_gameinfo_from_hid(request.hand_id)
                 gametype_id = info["gametypeId"] if info else None
+            if gametype_id is None and request.site_name and request.pool_name:
+                # A table the client log named before any of its hands was
+                # imported. Without this the statistics query below is skipped
+                # and the table's first update draws every block empty. Only
+                # this pool's own hands are consulted, and only when the pool
+                # is known: borrowing another table's stakes would be worse
+                # than showing nothing.
+                with contextlib.suppress(Exception):
+                    gametype_id = database.get_last_gametype_id_for_table(
+                        request.site_name,
+                        request.pool_name,
+                    )
 
             stat_dict = FastFoldEngine(db_connection=database).get_player_stats_for_seat_map(
                 request.seat_map,
@@ -262,6 +363,7 @@ class HudReadWorker(QThread):
             temp_key=request.temp_key,
             seat_map=dict(request.seat_map),
             stat_dict=stat_dict,
+            request_id=request.request_id,
         )
 
     def run(self) -> None:
@@ -298,6 +400,16 @@ class HudReadWorker(QThread):
 
             assert service is not None
             fast_fold = isinstance(pending, FastFoldStatsRequest)
+            if fast_fold and self._is_superseded(pending):
+                # The table has moved on while this waited its turn. Reading for
+                # it would spend a round trip on an answer the GUI discards.
+                log.debug(
+                    "Fast-Fold stats request %s for %s superseded before it ran",
+                    pending.request_id,
+                    pending.temp_key,
+                )
+                pending = None
+                continue
             try:
                 if fast_fold:
                     result = self._read_fast_fold_stats(database, pending)
@@ -335,10 +447,45 @@ class HudReadWorker(QThread):
             log.warning("HUD read worker did not stop in time")
 
 
+def parse_live_message(message: str) -> dict[str, Any] | None:
+    """The live-action payload a ZMQ message carries, or ``None``.
+
+    A capture sends two things on one socket: a bare hand id, and a prefixed
+    JSON payload naming an action still being played (#336). Anything malformed
+    answers ``None`` and is logged rather than raised -- one bad packet must
+    not take the receiver thread down with it.
+    """
+    if not message.startswith(LIVE_ACTION_PREFIX):
+        return None
+    try:
+        payload = json.loads(message[len(LIVE_ACTION_PREFIX):])
+    except ValueError:
+        log.warning("Dropping a malformed live-action message (%s chars)", len(message))
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def route_live_action(payload: dict[str, Any], tables: Mapping[str, str], huds: Mapping[str, Any]) -> Any:
+    """The HUD a live action belongs to, or ``None`` when no table claims it.
+
+    The capture derives a table id from the hand number; HUD_main learns which
+    of its HUDs serves that table the first time it imports one of its hands,
+    keyed by the table name's last token, which is that same id for a cash game
+    and its trailing number for a tournament. Until a table's first hand has
+    been imported there is no HUD to route to, and the action is dropped: the
+    panels fall back to the hand-refresh path, which is what they did before
+    live context existed.
+    """
+    table = str(payload.get("table") or "").strip()
+    key = tables.get(table)
+    return huds.get(key) if key is not None else None
+
+
 class ZMQReceiver(QObject):
     """A QObject to receive ZMQ messages."""
 
     message_received = Signal(str)
+    live_action_received = Signal(dict)
 
     def __init__(self, port: str = "5555", parent: QObject | None = None) -> None:
         """Initialize the ZMQ receiver."""
@@ -363,9 +510,13 @@ class ZMQReceiver(QObject):
             if self.socket.closed:
                 return
             if self.socket in socks and socks[self.socket] == zmq.POLLIN:
-                hand_id = self.socket.recv_string(zmq.NOBLOCK)
-                log.info("ZMQ received hand ID: %s", hand_id)
-                self.message_received.emit(hand_id)
+                message = self.socket.recv_string(zmq.NOBLOCK)
+                payload = parse_live_message(message)
+                if payload is not None:
+                    self.live_action_received.emit(payload)
+                else:
+                    log.info("ZMQ received hand ID: %s", message)
+                    self.message_received.emit(message)
             else:
                 # Heartbeat
                 log.debug("Heartbeat: No message received")
@@ -403,6 +554,143 @@ class HudMainWindow(QWidget):
         self._on_close(event)
 
 
+class MacOSPermissionsDialog(QDialog):
+    """Explicit, non-modal onboarding for the HUD's macOS permissions.
+
+    Constructing or refreshing this dialog only runs side-effect-free
+    preflights. Native prompts and System Settings are reached exclusively from
+    the corresponding user-operated buttons.
+    """
+
+    status_changed = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Build the permission status and action rows."""
+        super().__init__(parent)
+        self.setWindowTitle("FPDB macOS Permissions")
+        self.setModal(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "FPDB checks these permissions without requesting them. "
+            "Use the buttons below only when you want macOS to prompt or open System Settings.",
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        screen_note = QLabel(
+            "macOS groups this under Screen & System Audio Recording. "
+            "FPDB reads window metadata only and does not request microphone access.",
+        )
+        screen_note.setWordWrap(True)
+        layout.addWidget(screen_note)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Permission"), 0, 0)
+        grid.addWidget(QLabel("Status"), 0, 1)
+        grid.addWidget(QLabel("Actions"), 0, 2, 1, 2)
+
+        self.screen_status_label = QLabel()
+        self.screen_request_button = QPushButton("Request Screen Recording")
+        self.screen_settings_button = QPushButton("Open Screen Recording Settings")
+        grid.addWidget(QLabel("Screen Recording"), 1, 0)
+        grid.addWidget(self.screen_status_label, 1, 1)
+        grid.addWidget(self.screen_request_button, 1, 2)
+        grid.addWidget(self.screen_settings_button, 1, 3)
+
+        self.accessibility_status_label = QLabel()
+        self.accessibility_request_button = QPushButton("Request Accessibility")
+        self.accessibility_settings_button = QPushButton("Open Accessibility Settings")
+        grid.addWidget(QLabel("Accessibility"), 2, 0)
+        grid.addWidget(self.accessibility_status_label, 2, 1)
+        grid.addWidget(self.accessibility_request_button, 2, 2)
+        grid.addWidget(self.accessibility_settings_button, 2, 3)
+
+        self.app_data_status_label = QLabel()
+        self.app_data_info_label = QLabel(
+            "Informational only: macOS prompts on the first protected Winamax file access, "
+            "using the bundle's NSAppDataUsageDescription.",
+        )
+        self.app_data_info_label.setWordWrap(True)
+        grid.addWidget(QLabel("App Data"), 3, 0)
+        grid.addWidget(self.app_data_status_label, 3, 1)
+        grid.addWidget(self.app_data_info_label, 3, 2, 1, 2)
+        grid.setColumnStretch(2, 1)
+        layout.addLayout(grid)
+
+        restart_note = QLabel(
+            "After changing Screen Recording, quit and reopen FPDB yourself if table titles remain unavailable. "
+            "FPDB never restarts automatically.",
+        )
+        restart_note.setWordWrap(True)
+        layout.addWidget(restart_note)
+
+        button_row = QHBoxLayout()
+        self.recheck_button = QPushButton("Recheck")
+        self.close_button = QPushButton("Close")
+        button_row.addWidget(self.recheck_button)
+        button_row.addStretch(1)
+        button_row.addWidget(self.close_button)
+        layout.addLayout(button_row)
+
+        self.screen_request_button.clicked.connect(self._request_screen_recording)
+        self.screen_settings_button.clicked.connect(self._open_screen_recording_settings)
+        self.accessibility_request_button.clicked.connect(self._request_accessibility)
+        self.accessibility_settings_button.clicked.connect(self._open_accessibility_settings)
+        self.recheck_button.clicked.connect(self.refresh_status)
+        self.close_button.clicked.connect(self.hide)
+
+    @staticmethod
+    def _binary_status(granted: bool) -> str:
+        return "Granted" if granted else "Missing"
+
+    def set_status(self, status: Any) -> None:
+        """Render an already-computed permission snapshot without side effects."""
+        self.screen_status_label.setText(self._binary_status(status.screen_recording))
+        self.accessibility_status_label.setText(self._binary_status(status.accessibility))
+        if status.app_data is None:
+            self.app_data_status_label.setText("Not preflightable")
+        else:
+            self.app_data_status_label.setText(self._binary_status(status.app_data))
+        self.screen_request_button.setEnabled(not status.screen_recording)
+        self.accessibility_request_button.setEnabled(not status.accessibility)
+
+    def refresh_status(self) -> Any:
+        """Run diagnostic-only preflights and update the three status rows."""
+        from fpdb.infrastructure.platform import permissions
+
+        status = permissions.get_status()
+        self.set_status(status)
+        self.status_changed.emit(status)
+        return status
+
+    def _request_screen_recording(self) -> None:
+        """Request Screen Recording after an explicit button click."""
+        from fpdb.infrastructure.platform import permissions
+
+        permissions.request_screen_recording_permission()
+        self.refresh_status()
+
+    def _request_accessibility(self) -> None:
+        """Request Accessibility after an explicit button click."""
+        from fpdb.infrastructure.platform import permissions
+
+        permissions.request_accessibility_permission(prompt=True)
+        self.refresh_status()
+
+    @staticmethod
+    def _open_screen_recording_settings() -> None:
+        from fpdb.infrastructure.platform import permissions
+
+        permissions.open_screen_recording_settings()
+
+    @staticmethod
+    def _open_accessibility_settings() -> None:
+        from fpdb.infrastructure.platform import permissions
+
+        permissions.open_accessibility_settings()
+
+
 class HudMain(QObject):
     """A main() object to own both the socket thread and the gui."""
 
@@ -412,17 +700,55 @@ class HudMain(QObject):
     winamax_table_update = Signal(object)
 
     AX_READS_PER_HAND = 6
+
+    #: Consecutive window reads that may fail to seat anyone before the reader
+    #: is given up on for that table. Two hands' worth.
+    #:
+    #: It was five, and five is what the evidence costs rather than what it is
+    #: worth: a read of a client that answers takes 94-218ms, synchronously, on
+    #: the GUI thread, six times a hand, per table. Thirty of them is four and a
+    #: half seconds of frozen HUD spent proving something a table caught
+    #: mid-redraw proves in one hand -- and a client that does not publish its
+    #: felt proves immediately. Two hands is still twice what it takes.
+    AX_FRUITLESS_READS_BEFORE_GIVING_UP = AX_READS_PER_HAND * 2
     """How many times a table's window may be re-read within one hand.
 
-    Each read costs ~20ms and the seats settle within the first few log lines,
-    so this bounds the cost while still letting a table that was read before it
-    was drawn fill in.
+    A read costs ~20ms through the macOS accessibility API and 100-300ms
+    through Windows UIAutomation (measured on a Chromium window), and the seats
+    settle within the first few log lines, so this bounds the cost while still
+    letting a table that was read before it was drawn fill in. Reads stop as
+    soon as the table looks full, so a full table costs one or two of them.
     """
 
     HERO_SLOT = 0
     """The bottom chair, which is where the client always draws the hero."""
 
+    FF_IDLE_RECHECK_SECONDS = 20.0
+    """Silence on a Fast-Fold table before its window is asked about directly.
+
+    Long enough that a hand being tanked over is never mistaken for an empty
+    table -- the log emits a line for every action, so a hand in progress
+    refreshes this constantly -- and short enough that blocks do not sit over
+    an abandoned felt for the minutes measured before the sweep existed.
+    """
+
+    FF_UNMAPPED_LOG_MEMORY = 500
+    """Hands remembered as already reported missing from the log window map.
+
+    Only large enough that the two snapshots of one hand fall inside it; the
+    set is cleared wholesale past this, since an old hand can no longer be
+    warned about twice.
+    """
+
     MIN_PLAYERS_TO_SHOW = 2
+
+    #: How long after asking for a table's statistics further ring growth is
+    #: coalesced instead of asking again. The client log names players one at a
+    #: time, so a six-handed table produced a request, a database round trip and
+    #: a redraw per name -- fourteen in one hand, across two tables, in a
+    #: measured session. The first answer is never delayed by this; only the
+    #: ones chasing it are merged.
+    FF_STATS_COALESCE_MS = 400
     """Players a window must be drawing before its blocks are worth showing.
 
     The hero alone means the table is between hands or waiting for players, and
@@ -437,6 +763,10 @@ class HudMain(QObject):
     """
 
     AX_RECHECK_DELAYS_MS = (250, 700, 1500)
+
+    #: Hands remembered as having a seat-wait recheck already scheduled. Bounded
+    #: because a session plays thousands of them and nothing else prunes it.
+    FF_SEAT_WAIT_MEMO_LIMIT = 200
     """When to look at the window again after a hand starts.
 
     Every log line of a new hand -- the hand id, both blinds, the hole cards --
@@ -447,6 +777,8 @@ class HudMain(QObject):
     def __init__(self, options: Values, db_name: str = "fpdb") -> None:
         """Initialize the main HUD application."""
         self.options = options
+        self._winamax_regular_seen: dict[Any, tuple[Any, str]] = {}
+        self._winamax_regular_unmatched: set[tuple[Any, str]] = set()
         QObject.__init__(self)
         self.db_name = db_name
         self._shutdown_started = False
@@ -579,21 +911,33 @@ class HudMain(QObject):
         self.config = Configuration.Config(file=options.config, dbname=options.dbname)
         log.info("HUD_main initialized - Config loaded, OS family: %s", self.config.os_family)
 
-        # Selecting the right module for the OS
+        # Selecting the right module for the OS. Imported through the package
+        # rather than as bare top-level modules: a bare "import OSXTables" only
+        # resolves because the repository root happens to be on sys.path, which
+        # is true of a source checkout and of HUD_main's own frozen archive, but
+        # not of every way this file can be run. Each import stays inside its
+        # branch -- the other two backends need bindings this platform lacks --
+        # and the module is bound once, so mypy sees a single definition.
+        tables: ModuleType
         if self.config.os_family == "Linux":
             # Simplified: XWayland support or X11 fallback
             if os.getenv("QT_QPA_PLATFORM") == "xcb" or not os.environ.get("WAYLAND_DISPLAY"):
                 log.info("XWayland forced under wayland → backend XTables")
-                import XTables as Tables
             else:
                 log.info("Session X11 detected → backend XTables")
-                import XTables as Tables
+            from fpdb_3_legacy import XTables
+
+            tables = XTables
         elif self.config.os_family == "Mac":
-            import OSXTables as Tables
+            from fpdb_3_legacy import OSXTables
+
+            tables = OSXTables
         elif self.config.os_family in ("XP", "Win7"):
-            import WinTables as Tables
+            from fpdb_3_legacy import WinTables
+
+            tables = WinTables
         log.info("HudMain starting: Using db name = %s", db_name)
-        self.Tables = Tables  # Assign Tables to self.Tables
+        self.Tables = tables
 
         # Surface missing macOS privacy permissions at startup so table-detection
         # failures ("table name ... not found") are explained before the first hand.
@@ -620,6 +964,17 @@ class HudMain(QObject):
         try:
             # HUD dictionary and parameters
             self.hud_dict: dict[str, Hud.Hud] = {}
+            # Tables that have shown a hand, by the id a live capture names them
+            # by (#336). Filled as hands are imported; a live action for a table
+            # that has not imported one yet has no HUD to go to.
+            self._live_tables: dict[str, str] = {}
+            # Canonical window_id -> temp_key -> generation mapping. hud_dict is
+            # keyed by a table's text name, which a Fast-Fold pool shares across
+            # several windows; this is what makes "one renderer per window"
+            # enforceable rather than hoped for.
+            self._window_registry = HudWindowRegistry()
+            self._hud_generation = 0
+            self._macos_permissions_dialog: MacOSPermissionsDialog | None = None
             # Session-only profile choices made from an individual table menu.
             # Values include game identity so a recycled table key cannot leak a
             # Hold'em/PLO choice into another game.
@@ -633,25 +988,85 @@ class HudMain(QObject):
             # once; this makes read_stdin idempotent so each hand refreshes the
             # HUD exactly once, without re-running create/update on a duplicate.
             self._last_processed_hands: dict[str, str] = {}
+            # Tables whose window this session found at least once, and tables
+            # already reported as not found. Together they keep "table not found"
+            # an error the first time and a routine note once the table is known
+            # to have existed and closed (see _log_table_not_found).
+            self._tables_attached: set[str] = set()
+            self._tables_not_found: set[str] = set()
             # Winamax log pool -> hud_dict key, learned once a hand from that
             # table has been imported and reused while the table stays open.
             self._winamax_pool_huds: dict[str, str] = {}
+            # Imported hands use the human table key while a live FastFold HUD
+            # may also carry a window discriminator. Keep that alias explicit
+            # instead of making every caller guess with string prefixes.
+            self._fast_fold_aliases: dict[str, str] = {}
             # hud_dict keys known to be Fast-Fold tables.
             self._fast_fold_tables: set[str] = set()
             # hud_dict key -> the seat map last sent to the worker, so an
             # unchanged table does not queue a read on every log line.
             self._fast_fold_pending: dict[str, dict[int, str]] = {}
+            # Coalescing of stats requests: when the last one went out per
+            # table, the newest seat map waiting behind it, and the timer that
+            # will send that one. See FF_STATS_COALESCE_MS.
+            self._ff_last_request_at: dict[str, float] = {}
+            self._ff_coalesced: dict[str, tuple[Any, dict[int, str], Any]] = {}
+            self._ff_coalesce_timers: dict[str, QTimer] = {}
             # Pools reported once as having no HUD of their own, so the warning
             # is not repeated on every log line.
             self._unpaired_pools: set[str] = set()
             # window title -> (hand id, slot -> login read off that window). Kept
             # per window so two tables do not evict each other, and per hand
             # because each read walks another process's accessibility tree.
-            self._ax_rings: dict[str, tuple[str, dict[int, str], int]] = {}
+            # Window reads in a row that found nobody, and whether that has gone
+            # on long enough to stop trying -- both per table. A single counter
+            # for the whole session reached its threshold in half the hands with
+            # two tables open, and a quarter with four, so multitabling gave up
+            # on the reader before it had the evidence a single table needed.
+            # See AX_FRUITLESS_READS_BEFORE_GIVING_UP.
+            # How long to let the client log finish naming a table's players
+            # before showing the ones it has. Read once: it is a preference, not
+            # something that changes within a session.
+            try:
+                self._fast_fold_seat_wait_ms = int(self.config.get_hud_ui_parameters().get("fast_fold_seat_wait_ms", 500))
+            except Exception:
+                log.debug("Could not read fast_fold_seat_wait_ms; using the default", exc_info=True)
+                self._fast_fold_seat_wait_ms = 500
+            self._ff_seat_wait_scheduled: set[tuple[str, str]] = set()
+            # What has been learned about reading each table's window: the
+            # per-hand ring, how many reads in a row could not seat anyone, and
+            # whether the reader has been given up on for it. One object with one
+            # lifetime -- see TableReadState.
+            self._table_reads: dict[str, TableReadState] = {}
+            # "off" skips the window reader outright. On a client that never
+            # publishes its felt, the reads are pure stutter -- and the player
+            # who has established that should not have to re-establish it every
+            # session, two hands at a time.
+            try:
+                self._ax_reader_enabled = (
+                    str(self.config.get_hud_ui_parameters().get("fast_fold_window_seats", "auto")) != "off"
+                )
+            except Exception:
+                log.debug("Could not read fast_fold_window_seats; leaving the reader on", exc_info=True)
+                self._ax_reader_enabled = True
             # Timeline bookkeeping: when each hand's first log line arrived, and
-            # which hand a table's in-flight stats request belongs to.
+            # which hand/table request is currently allowed to update the HUD.
             self._ff_started: dict[str, float] = {}
             self._ff_pending_hand: dict[str, str] = {}
+            self._ff_pending_request: dict[str, int] = {}
+            # HUD generation each in-flight read was started for, so a reply
+            # that outlives its HUD is dropped instead of painting the rebuild.
+            self._ff_pending_generation: dict[str, int | None] = {}
+            self._ff_request_sequence = 0
+            # Hands already reported as absent from the log window map. Both
+            # snapshots of one hand pass through qualification, and warning
+            # twice made one delayed hand look like two.
+            self._ff_unmapped_logged: set[str] = set()
+            self._import_request_sequence = 0
+            # When each Fast-Fold table was last spoken about by the client
+            # log. A table nobody has mentioned for a while is asked directly
+            # whether it still seats anyone; see _sweep_stale_fast_fold_tables.
+            self._ff_last_activity: dict[str, float] = {}
             # Learned from the first imported Winamax hand. A log-created HUD
             # does not need it (it reads nothing from the database), but keeping
             # it lets the table carry the same identity as an imported one.
@@ -684,27 +1099,7 @@ class HudMain(QObject):
                 height=self.hud_params["card_ht"],
             )
 
-            from fpdb_3_legacy.winamax_ax_seats import WinamaxAXSeatReader, is_supported
-            from fpdb_3_legacy.winamax_live_log_reader import WinamaxLiveLogReader
-            from fpdb_3_legacy.winamax_pool_games import WinamaxPoolGames
-
-            # Reads seats off the table window itself. The log can only say who
-            # has acted, and never where they sit; this knows both, immediately.
-            self.winamax_ax_seats = WinamaxAXSeatReader() if is_supported() else None
-
-            # The window says which game it deals only to a process holding
-            # macOS Accessibility, which packaged builds do not. Imported hands
-            # say it unconditionally, so what they prove is kept.
-            self.winamax_pool_games = WinamaxPoolGames(
-                Path(Configuration.CONFIG_PATH) / "winamax_pool_games.json" if Configuration.CONFIG_PATH else None,
-            )
-
-            # Queued by Qt because the reader emits from its tailing thread.
-            self.winamax_table_update.connect(self._on_winamax_table_update)
-            self.winamax_log_reader = WinamaxLiveLogReader(
-                on_table_update=self.winamax_table_update.emit,
-            )
-            self.winamax_log_reader.start()
+            self._initialize_winamax_live_sources()
 
             # Cache initialization
             self.cache: TTLCache = TTLCache(maxsize=1000, ttl=300)  # Cache of 1000 elements with a TTL of 5 minutes
@@ -725,6 +1120,12 @@ class HudMain(QObject):
             self._hand_batch_timer.setInterval(HAND_BATCH_INTERVAL_MS)
             self._hand_batch_timer.timeout.connect(self._drain_pending_hands)
 
+            self._cleanup_timer = QTimer(self)
+            self._cleanup_timer.setInterval(2000)
+            self._cleanup_timer.timeout.connect(self._cleanup_closed_windows)
+            self._cleanup_timer.timeout.connect(self._sweep_stale_fast_fold_tables)
+            self._cleanup_timer.start()
+
             self._db_worker: HudReadWorker | None = HudReadWorker(self.config, parent=self)
             self._db_worker.ready.connect(self._on_db_worker_ready)
             self._db_worker.snapshot_ready.connect(self._on_db_snapshot)
@@ -744,6 +1145,7 @@ class HudMain(QObject):
             self.zmq_receiver: ZMQReceiver | None = ZMQReceiver(parent=self)
             log.info("ZMQ receiver created successfully")
             self.zmq_receiver.message_received.connect(self.handle_message)
+            self.zmq_receiver.live_action_received.connect(self.handle_live_action)
             self.zmq_worker: ZMQWorker | None = ZMQWorker(self.zmq_receiver)
             self.zmq_worker.error_occurred.connect(self.handle_worker_error)
             log.info("Starting ZMQ worker...")
@@ -758,38 +1160,98 @@ class HudMain(QObject):
             raise
 
     def _check_macos_permissions(self) -> None:
-        """Diagnose macOS privacy permissions required for table detection.
+        """Diagnose macOS privacy permissions without prompting or opening Settings.
 
-        Screen Recording is needed for Quartz to expose window titles;
-        Accessibility/Automation is needed for the AppleScript fallback used by
-        Electron clients (e.g. Winamax). Logs a clear, actionable message for any
-        missing permission. Set ``FPDB_REQUEST_MACOS_PERMISSIONS=1`` to also
-        trigger the native prompts and open the relevant System Settings panes.
+        This startup path is deliberately identical for source and frozen
+        builds. Permission requests belong only to the explicit onboarding
+        buttons in :class:`MacOSPermissionsDialog`.
         """
         try:
             from fpdb.infrastructure.platform import permissions
         except Exception:
             log.debug("macOS permissions preflight unavailable", exc_info=True)
+            self._macos_permission_status = None
             return
 
         status = permissions.get_status()
+        self._macos_permission_status = status
         if status.all_granted:
             log.info("macOS permissions OK (Screen Recording + Accessibility granted)")
-            return
-
         for message in permissions.describe_missing(status):
             log.warning(message)
+        if status.app_data is None:
+            log.info("macOS App Data permission is managed by macOS and cannot be preflighted safely")
 
-        if os.getenv("FPDB_REQUEST_MACOS_PERMISSIONS") == "1":
-            if not status.screen_recording:
-                log.info("Requesting Screen Recording permission (native prompt)...")
-                permissions.request_screen_recording_permission()
-                permissions.open_screen_recording_settings()
-            if not status.accessibility:
-                log.info("Requesting Accessibility permission (native prompt)...")
-                permissions.request_accessibility_permission(prompt=True)
-                permissions.open_accessibility_settings()
-            log.warning("After granting permissions, restart FPDB for them to take effect.")
+    @staticmethod
+    def _site_enabled_in_config(config: Any, site_name: str) -> bool:
+        """Read an enabled-site flag from the loaded config without resolving paths."""
+        try:
+            enabled_sites = config.get_supported_sites()
+            wanted = site_name.casefold()
+            return any(str(site).casefold() == wanted for site in enabled_sites)
+        except Exception:
+            log.warning("Could not read enabled sites while initializing %s live sources", site_name, exc_info=True)
+            return False
+
+    def _initialize_winamax_live_sources(self) -> None:
+        """Start Winamax-only helpers when Winamax is enabled in the loaded config."""
+        self.winamax_ax_seats = None
+        self.winamax_pool_games = None
+        self.winamax_log_reader = None
+        if not self._site_enabled_in_config(self.config, "Winamax"):
+            log.info("Winamax is disabled; live log and Accessibility helpers will not be initialized")
+            return
+
+        from fpdb_3_legacy.winamax_ax_seats import WinamaxAXSeatReader, is_supported
+        from fpdb_3_legacy.winamax_live_log_reader import WinamaxLiveLogReader
+        from fpdb_3_legacy.winamax_pool_games import WinamaxPoolGames
+
+        # Reads seats off the table window itself. The log can only say who has
+        # acted, and never where they sit; this knows both, immediately.
+        self.winamax_ax_seats = WinamaxAXSeatReader() if is_supported() else None
+        if self.winamax_ax_seats is not None:
+            # Whatever the reader has to build, it builds now: the first hand of
+            # the session must not pay for it on the GUI thread.
+            with contextlib.suppress(Exception):
+                self.winamax_ax_seats.prewarm()
+
+        # The window says which game it deals only to a process holding macOS
+        # Accessibility. Imported hands say it unconditionally, so keep what
+        # they prove for later live hands.
+        self.winamax_pool_games = WinamaxPoolGames(
+            Path(Configuration.CONFIG_PATH) / "winamax_pool_games.json" if Configuration.CONFIG_PATH else None,
+        )
+
+        # Queued by Qt because the reader emits from its tailing thread.
+        self.winamax_table_update.connect(self._on_winamax_table_update)
+        self.winamax_log_reader = WinamaxLiveLogReader(
+            on_table_update=self.winamax_table_update.emit,
+        )
+        self.winamax_log_reader.start()
+
+    def show_macos_permissions(self) -> None:
+        """Show the explicit macOS permission onboarding window."""
+        dialog = getattr(self, "_macos_permissions_dialog", None)
+        if dialog is None:
+            dialog = MacOSPermissionsDialog(self.main_window)
+            dialog.status_changed.connect(self._remember_macos_permission_status)
+            self._macos_permissions_dialog = dialog
+        dialog.refresh_status()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _remember_macos_permission_status(self, status: Any) -> None:
+        """Keep the latest UI preflight snapshot for diagnostics."""
+        self._macos_permission_status = status
+
+    def _on_application_state_changed(self, state: Any) -> None:
+        """Recheck an open onboarding window after returning from Settings."""
+        if state != Qt.ApplicationState.ApplicationActive:
+            return
+        dialog = getattr(self, "_macos_permissions_dialog", None)
+        if dialog is not None and dialog.isVisible():
+            dialog.refresh_status()
 
     def handle_worker_error(self, error_message: str) -> None:
         """Handle errors from the ZMQ worker."""
@@ -958,13 +1420,16 @@ class HudMain(QObject):
         qualified = self._qualify_fast_fold_table(info, hand_id)
         if qualified is None:
             return None
-        info = qualified
+        info = qualified.info
         table_name = info.table_name
         table_info = info
 
         temp_key = self._get_temp_key(info.game_type, info.tour_number, info.tab_number, table_name)
         if info.fast:
             self._fast_fold_tables.add(temp_key)
+        resolved_key = self._resolve_fast_fold_key(temp_key, table_no=qualified.table_no)
+        if resolved_key != temp_key:
+            return resolved_key
         if temp_key in self.hud_dict:
             return temp_key
         if self._handle_tournament_table_changes(info.game_type, temp_key, info.tour_number):
@@ -982,6 +1447,62 @@ class HudMain(QObject):
             self._last_table_info[temp_key] = table_info
             return temp_key
         return None
+
+    def _resolve_fast_fold_key(self, temp_key: str, table_no: str | None = None) -> str:
+        """Resolve an imported human key to its active window HUD key.
+
+        An imported hand carries the pool's name; the live log built that
+        table's HUD under a key qualified by its native window id. Failing to
+        connect the two is what makes an import rebuild a HUD that is already
+        on screen, so three routes are tried before giving up and returning the
+        bare key: the alias learned when the live HUD was created, a single
+        window-qualified key under this name, and -- when the client's window
+        index is known -- the window itself, which is the only identity that
+        cannot be confused between two tables of one pool.
+        """
+        aliases = getattr(self, "_fast_fold_aliases", {})
+        aliased = aliases.get(temp_key)
+        hud_dict = getattr(self, "hud_dict", {})
+        if isinstance(aliased, str) and aliased in hud_dict:
+            return aliased
+        candidates = [key for key in hud_dict if key.startswith(f"{temp_key} #")]
+        if len(candidates) == 1:
+            return candidates[0]
+
+        window_key = self._live_hud_key_for_table_no(table_no)
+        if window_key is not None:
+            # Remember it so the next hand on this pool takes the cheap route.
+            if isinstance(aliases, dict):
+                aliases[temp_key] = window_key
+            return window_key
+        return temp_key
+
+    def _live_hud_key_for_table_no(self, table_no: str | None) -> str | None:
+        """Return the HUD key already rendering the client window ``table_no``.
+
+        Asks the resolver which native window carries that client index, then
+        the registry which HUD holds it. Silent when the resolver is absent or
+        the window has closed: the caller then goes on to create a HUD, which
+        is the right outcome when no renderer holds the window.
+        """
+        if not table_no:
+            return None
+        reader = getattr(self, "winamax_ax_seats", None)
+        if reader is None:
+            return None
+        try:
+            window = reader.find_table_window(table_no)
+        except Exception:
+            log.exception("Could not resolve Winamax window for client index %s", table_no)
+            return None
+        if window is None or getattr(window, "window_id", None) is None:
+            return None
+        registry = getattr(self, "_window_registry", None)
+        registered = registry.key_for(window.window_id) if registry is not None else None
+        if registered is not None and registered in getattr(self, "hud_dict", {}):
+            return registered
+        existing = self._find_hud_by_window_id(window.window_id)
+        return None if existing is None else existing[0]
 
     def _on_db_snapshot(self, snapshot: HudBatchSnapshot) -> None:
         """Apply a database-free snapshot on the Qt thread."""
@@ -1078,6 +1599,14 @@ class HudMain(QObject):
         self.main_window.setLayout(self.vb)
         self.label = QLabel("Closing this window will exit from the HUD.")
         self.vb.addWidget(self.label)
+        if self.config.os_family == "Mac":
+            self._macos_permissions_dialog = None
+            self.macos_permissions_button = QPushButton("macOS Permissions…")
+            self.macos_permissions_button.clicked.connect(self.show_macos_permissions)
+            self.vb.addWidget(self.macos_permissions_button)
+            app = QApplication.instance()
+            if app is not None:
+                app.applicationStateChanged.connect(self._on_application_state_changed)
         self.main_window.setWindowTitle("HUD Main Window")
         cards_path = Path(self.config.graphics_path) / "tribal.jpg"
         if cards_path.exists():
@@ -1093,6 +1622,55 @@ class HudMain(QObject):
         """Handle the close event of the main window."""
         self.destroy()
         event.accept()
+
+    def _remember_live_table(self, temp_key: str, table_name: Any) -> None:
+        """Learn which HUD serves a table id, so live actions can be routed.
+
+        A capture names a table by the id read off its hand numbers; the table
+        name the database spells carries that same id as its last token -- the
+        whole name for a cash game, the trailing number for a tournament. The
+        first imported hand of a table is what teaches this, which is why a
+        table's very first hand is played without live panels.
+        """
+        token = str(table_name or "").strip().split()[-1] if str(table_name or "").strip() else ""
+        if token:
+            self._live_tables[token] = temp_key
+
+    def handle_live_action(self, payload: dict[str, Any]) -> None:
+        """Route one live action to the HUD whose table it belongs to (#336).
+
+        The capture sends actions as they are played, so the dynamic panels can
+        move at the decision instead of one hand behind. Everything here is
+        best-effort: a payload no table claims is dropped with a debug line,
+        and a HUD that rejects the action keeps the context it had.
+        """
+        try:
+            hud = route_live_action(payload, self._live_tables, self.hud_dict)
+            if hud is None:
+                log.debug(
+                    "Live action for table %s has no HUD yet (hand %s)",
+                    payload.get("table"),
+                    payload.get("hand_id"),
+                )
+                return
+            action = self._live_action_from_payload(payload)
+            if action is not None:
+                hud.accept_live_action(action, hand_id=str(payload.get("hand_id") or ""))
+        except Exception:  # noqa: BLE001 - a live feed must never break the HUD loop
+            log.exception("Could not route a live action to its HUD")
+
+    def _live_action_from_payload(self, payload: dict[str, Any]) -> Any:
+        """The room's action record as the live-context module reads it."""
+        from fpdb_3_legacy import hud_live_context
+
+        record = payload.get("record")
+        if not isinstance(record, dict):
+            return None
+        return hud_live_context.coinpoker_action(
+            record,
+            hand_id=str(payload.get("hand_id") or ""),
+            sequence=int(payload.get("sequence") or 0),
+        )
 
     def handle_message(self, hand_id: str) -> None:
         """Handle an incoming message from the ZMQ receiver."""
@@ -1117,6 +1695,14 @@ class HudMain(QObject):
         if self._shutdown_started:
             return
         self._shutdown_started = True
+
+        # Stop every timer owned by the HUD before the event loop can dispatch
+        # another callback against tables that are already being torn down.
+        for timer_name in ("_cleanup_timer", "check_tables_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                with contextlib.suppress(RuntimeError):
+                    timer.stop()
 
         # A batch still waiting would fire against a torn-down connection.
         batch_timer = getattr(self, "_hand_batch_timer", None)
@@ -1158,15 +1744,174 @@ class HudMain(QObject):
         QCoreApplication.quit()
 
     def _clear_fast_fold_table(self, temp_key: str, hud: Hud.Hud, hand_id: str, reason: str) -> None:
-        """Take a Fast-Fold table's blocks down, once, and say why.
+        """Take a Fast-Fold table's blocks down and say why.
 
         The seat windows hide themselves when their seat holds nobody, so
         emptying the seats is what removes them from an idle felt.
         """
-        if self._fast_fold_pending.pop(temp_key, None) is None and not getattr(hud, "stat_dict", None):
+        pending = self._fast_fold_pending.pop(temp_key, None)
+        pending_requests = getattr(self, "_ff_pending_request", None)
+        if pending_requests is not None:
+            pending_requests.pop(temp_key, None)
+        pending_hands = getattr(self, "_ff_pending_hand", None)
+        if pending_hands is not None:
+            pending_hands.pop(temp_key, None)
+        pending_generations = getattr(self, "_ff_pending_generation", None)
+        if pending_generations is not None:
+            pending_generations.pop(temp_key, None)
+        self._forget_coalesced_fast_fold_stats(temp_key)
+        worker = getattr(self, "_db_worker", None)
+        if worker is not None:
+            with contextlib.suppress(Exception):
+                worker.forget_fast_fold_table(temp_key)
+        if pending is None and not getattr(hud, "stat_dict", None) and not getattr(hud, "seat_players", None):
             return  # already down
         FastFoldEngine.clear_seats(hud)
         self._ff_trace(hand_id, "cleared", f"table={temp_key} ({reason})")
+
+    def _sweep_stale_fast_fold_tables(self) -> None:
+        """Take down blocks left over a table the log has gone quiet on.
+
+        Clearing a Fast-Fold table is otherwise driven entirely by the client
+        log: the hand-over line, or the next hand's start. Neither arrives when
+        the hero has been moved away and the felt is waiting for players, and
+        neither arrives for a hand that was already finished when the reader
+        started tailing -- which is why starting the HUD mid-hand left one
+        table showing the remains of a hand nobody was playing. Measured on a
+        real session, blocks stayed up over an empty table for 50, 80 and 124
+        seconds at a stretch.
+
+        So a table nobody has said anything about for a while is asked
+        directly. Only a window that answers with the hero drawn and nobody
+        else is cleared: the client always draws the hero when it draws the
+        table at all, so a read without the hero is a failed or half-finished
+        read rather than an empty table, and acting on it would blank a live
+        table every time the accessibility API was slow.
+        """
+        reader = getattr(self, "winamax_ax_seats", None)
+        if reader is None:
+            return
+        now = time.monotonic()
+        for temp_key, hud in list(self.hud_dict.items()):
+            if not getattr(hud, "is_fast_fold", False):
+                continue
+            if not (getattr(hud, "stat_dict", None) or getattr(hud, "seat_players", None)):
+                continue  # nothing on screen to take down
+            idle = now - self._ff_last_activity.get(temp_key, now)
+            if idle < self.FF_IDLE_RECHECK_SECONDS:
+                continue
+
+            slots = self._read_window_slots(hud)
+            # Whatever the answer, do not ask again for another idle period:
+            # each read walks another process's accessibility tree.
+            self._ff_last_activity[temp_key] = now
+            if slots is None or self.HERO_SLOT not in slots:
+                continue  # could not read it; leave what is on screen alone
+            if len(slots) >= self.MIN_PLAYERS_TO_SHOW:
+                continue  # really still being played
+
+            self._clear_fast_fold_table(
+                temp_key,
+                hud,
+                "idle-sweep",
+                f"the window seats {len(slots)} player(s) after {idle:.0f}s without a log line",
+            )
+
+    def _read_window_slots(self, hud: Hud.Hud) -> dict[int, str] | None:
+        """Read a table window's seats now, bypassing the per-hand cache.
+
+        None when there is nothing to read from -- no resolver, or a HUD whose
+        table has no title -- which the caller must not confuse with an empty
+        table.
+        """
+        reader = getattr(self, "winamax_ax_seats", None)
+        table = getattr(hud, "table", None)
+        title = getattr(table, "title", "") or ""
+        if reader is None or not title:
+            return None
+        # The same two answers the per-hand path respects. Without them the idle
+        # sweep kept walking another process's accessibility tree every
+        # FF_IDLE_RECHECK_SECONDS, for the life of the session, on exactly the
+        # clients the breaker exists to stop reading -- and for a table nobody
+        # was even playing. Reported by Codex on the pull request.
+        table_key = getattr(table, "key", None) or title
+        reads = getattr(self, "_table_reads", {}).get(table_key)
+        if not getattr(self, "_ax_reader_enabled", True) or (reads is not None and reads.gave_up):
+            return None
+        try:
+            return reader.read_window(
+                title,
+                getattr(hud, "max", 6) or 6,
+                window_id=getattr(table, "number", None),
+            ) or {}
+        except Exception:
+            log.exception("Could not re-read the Fast-Fold window %r while sweeping idle tables", title)
+            return None
+
+    def _cleanup_closed_windows(self) -> None:
+        """Close HUD overlays for Winamax table windows that have closed at session end."""
+        import platform
+        if platform.system() != "Windows":
+            return
+        import ctypes
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return
+        is_window = windll.user32.IsWindow
+        to_remove = []
+        for temp_key, hud in list(self.hud_dict.items()):
+            if not getattr(hud, "is_fast_fold", False):
+                continue
+            m = re.search(r"#(\d+)$", temp_key)
+            if m:
+                hwnd = int(m.group(1))
+                if not is_window(hwnd):
+                    to_remove.append((temp_key, hud))
+        for temp_key, hud in to_remove:
+            log.info("Closing Fast-Fold HUD for closed window: %s", temp_key)
+            self._clear_fast_fold_table(temp_key, hud, "session-end", "window closed")
+            close_hud = getattr(hud, "close", getattr(hud, "kill", None))
+            if callable(close_hud):
+                with contextlib.suppress(Exception):
+                    close_hud()
+            self.hud_dict.pop(temp_key, None)
+            # This path bypasses idle_kill, so the window it held has to be
+            # given back explicitly or the next HUD on it reads as a duplicate.
+            self._forget_window_seat_state(temp_key, getattr(getattr(hud, "table", None), "number", None))
+            self._window_registry.release(temp_key)
+            aliases = getattr(self, "_fast_fold_aliases", None)
+            if aliases is not None:
+                for alias, live_key in list(aliases.items()):
+                    if live_key == temp_key:
+                        aliases.pop(alias, None)
+
+    def _schedule_seat_wait_recheck(self, update: Any, elapsed: float) -> None:
+        """Come back when the seat wait is up, once per hand and table.
+
+        Only needed when the configured wait outlasts AX_RECHECK_DELAYS_MS. Below
+        that, the rechecks already scheduled at hand start arrive after the
+        deadline and this would be a second timer saying the same thing.
+
+        The test is on the setting, not on what is left of it. Comparing the
+        remaining time instead left a band just above the last recheck with no
+        wakeup at all: at a 2000ms wait, a ring arriving at 600ms leaves 1400,
+        which reads as "the rechecks have this" -- and they do not, because they
+        all fire before 2000ms. Every later call inside the hand makes the same
+        wrong judgement, so nothing looked again until the hand ended. Reported
+        by Codex on the pull request.
+        """
+        if self._fast_fold_seat_wait_ms <= max(self.AX_RECHECK_DELAYS_MS):
+            return
+        remaining_ms = max(0, int(self._fast_fold_seat_wait_ms - elapsed * 1000))
+        pending = self._ff_seat_wait_scheduled
+        key = (update.pool, update.hand_id)
+        if key in pending:
+            return
+        pending.add(key)
+        if len(pending) > self.FF_SEAT_WAIT_MEMO_LIMIT:
+            pending.clear()
+            pending.add(key)
+        QTimer.singleShot(remaining_ms, lambda pool=update.pool: self._recheck_window(pool))
 
     def _recheck_window(self, pool: str) -> None:
         """Re-run a table's live update once the client has had time to draw it."""
@@ -1188,12 +1933,175 @@ class HudMain(QObject):
         elapsed = "" if started is None else f" +{(time.monotonic() - started) * 1000:.0f}ms"
         log.warning("FF[%s]%s %s %s", hand_id, elapsed, event, detail)
 
+    def _next_fast_fold_request_id(self) -> int:
+        """Return a process-local id for the next asynchronous seat read."""
+        request_id = int(getattr(self, "_ff_request_sequence", 0)) + 1
+        self._ff_request_sequence = request_id
+        return request_id
+
+    def _on_winamax_regular_table_update(self, update: Any) -> None:
+        """Publish an observed Winamax street to the matching ordinary HUD.
+
+        The application log contains explicit ``round flop/turn/river`` events.
+        Imported histories arrive after the hand, so they cannot drive the HUD
+        at the live decision. Pair the client's table index with its window;
+        never send a street from one table to another merely because one HUD is
+        open. Repeated action notifications within a street need no redraw.
+        """
+        if update.hand_over:
+            self._retire_winamax_regular_hand(update)
+            return
+        street = getattr(update, "street", "preflop")
+        if street not in ("preflop", "flop", "turn", "river"):
+            return
+        seen: dict[Any, tuple[Any, ...]] = getattr(self, "_winamax_regular_seen", {})
+        self._winamax_regular_seen = seen
+        # A hand can publish several meaningful snapshots on the same street:
+        # the open, calls, and 3-bet all change the live pot context before the
+        # flop. Folds also change the multiway situation postflop. Deduplicate
+        # identical state, not merely repeated notifications for a street.
+        signature: tuple[Any, ...] = (
+            update.hand_id,
+            str(street),
+            int(getattr(update, "preflop_raises", 0) or 0),
+            int(getattr(update, "preflop_calls", 0) or 0),
+            int(getattr(update, "preflop_calls_after_raise", 0) or 0),
+            str(getattr(update, "preflop_aggressor", "") or ""),
+            tuple(sorted(getattr(update, "folded_players", ()))),
+        )
+        if seen.get(update.pool) == signature:
+            return
+
+        key = self._winamax_regular_hud_key(update)
+        hud = self.hud_dict.get(key) if key is not None else None
+        if hud is None or str(getattr(hud, "site", "")).casefold() != "winamax":
+            if street != "preflop" and any(
+                str(getattr(item, "site", "")).casefold() == "winamax"
+                and not getattr(item, "is_fast_fold", False)
+                for item in self.hud_dict.values()
+            ):
+                missed: set[tuple[Any, str]] = getattr(self, "_winamax_regular_unmatched", set())
+                self._winamax_regular_unmatched = missed
+                if signature not in missed:
+                    missed.add(signature)
+                    if len(missed) > 256:
+                        missed.clear()
+                    log.warning(
+                        "Winamax live %s could not be attached to a HUD: table index=%s label=%r",
+                        street, update.table_no, getattr(update, "table_label", ""),
+                    )
+            return
+        if getattr(hud, "is_fast_fold", False):
+            return
+
+        from fpdb_3_legacy.winamax_live_log_reader import fpdb_hand_id
+
+        hand_id = fpdb_hand_id(update.hand_id) or str(update.hand_id)
+        if getattr(hud, "_winamax_live_hand_id", None) != hand_id:
+            hud.live_state.clear()
+            hud._winamax_live_hand_id = hand_id
+        preflop_raises = int(getattr(update, "preflop_raises", 0) or 0)
+        calls_after_raise = int(getattr(update, "preflop_calls_after_raise", 0) or 0)
+        pot_type = getattr(update, "pot_type", "") or ""
+        facing_action = None
+        labels: tuple[str, ...] = ()
+        if street == "preflop":
+            # The resolver rules describe the pot before the action Hero faces:
+            # one raise means an unopened pot facing a raise; two means a
+            # single-raised pot facing a 3-bet. Winamax's pot_type describes
+            # the resulting pot, so translate those first two counts here.
+            if preflop_raises == 1:
+                pot_type = "unopened"
+            elif preflop_raises == 2:
+                pot_type = "single_raised"
+            if preflop_raises:
+                facing_action = "raises"
+            if preflop_raises == 1 and calls_after_raise:
+                labels = ("squeeze_defence",)
+        hud.set_live_state(
+            street=street,
+            street_index=("preflop", "flop", "turn", "river").index(street),
+            pot_type=pot_type,
+            facing_action=facing_action,
+            labels=labels,
+            preflop_aggressor=getattr(update, "preflop_aggressor", "") or None,
+            folded_players=tuple(getattr(update, "folded_players", ())),
+            source="street_live",
+        )
+        hud.refresh_dynamic_panels()
+        seen[update.pool] = signature
+        if len(seen) > 256:
+            seen.clear()
+        log.debug("Winamax HUD street update: table=%s street=%s pot=%s", key, street, getattr(update, "pot_type", ""))
+
+    def _retire_winamax_regular_hand(self, update: Any) -> None:
+        """Forget this hand's live street when its matching table reports completion.
+
+        A delayed hand-over event from a previous hand must not clear the new
+        hand's live state, so retire only an exact normalized-ID match.
+        """
+        key = self._winamax_regular_hud_key(update)
+        hud = self.hud_dict.get(key) if key is not None else None
+        if hud is None or str(getattr(hud, "site", "")).casefold() != "winamax":
+            return
+
+        from fpdb_3_legacy.winamax_live_log_reader import fpdb_hand_id
+
+        hand_id = fpdb_hand_id(update.hand_id) or str(update.hand_id)
+        if getattr(hud, "_winamax_live_hand_id", None) != hand_id:
+            return
+
+        hud.live_state.clear()
+        hud._winamax_live_hand_id = None
+        for aux in getattr(hud, "aux_windows", ()):
+            forget = getattr(aux, "forget_dynamic_panels", None)
+            if callable(forget):
+                forget()
+        hud.refresh_dynamic_panels()
+
+    def _winamax_regular_hud_key(self, update: Any) -> str | None:
+        """Find a classic Winamax window even when its title has no log index.
+
+        Fast-Fold windows carry ``[table] N`` in their title, but ordinary
+        cash windows such as ``Winamax Casablanca`` do not. Match the last
+        imported hand through the log's site-hand map first, then the client's
+        explicit table label. Never guess when more than one HUD matches.
+        """
+        key = self._live_hud_key_for_table_no(str(update.table_no))
+        if key is not None:
+            return key
+
+        ordinary = {
+            name: hud for name, hud in self.hud_dict.items()
+            if str(getattr(hud, "site", "")).casefold() == "winamax"
+            and not getattr(hud, "is_fast_fold", False)
+        }
+        reader = getattr(self, "winamax_log_reader", None)
+        if reader is not None:
+            by_hand = [
+                name for name, hud in ordinary.items()
+                if isinstance((site_hand := getattr(getattr(hud, "hand_instance", None), "handid", None)), (str, int))
+                and reader.table_no_for_hand(str(site_hand)) == str(update.table_no)
+            ]
+            if len(by_hand) == 1:
+                return by_hand[0]
+            if len(by_hand) > 1:
+                return None
+
+        label = str(getattr(update, "table_label", "") or "").strip().casefold()
+        if not label:
+            return None
+        by_label = [
+            name for name, hud in ordinary.items()
+            if str(getattr(hud.table, "key", "") or "").strip().casefold() == label
+            or str(getattr(hud.table, "title", "") or "").strip().casefold() == f"winamax {label}"
+        ]
+        return by_label[0] if len(by_label) == 1 else None
+
     def _on_winamax_table_update(self, update: Any) -> None:
         """Apply a live Winamax log update. Runs on the GUI thread."""
         if not update.pool.startswith(FAST_FOLD_POOL_PREFIX):
-            # An ordinary cash or tournament table. It has a HUD of its own,
-            # driven by imports; tracing it and scheduling window rechecks for
-            # it would be work with nothing at the end of it.
+            self._on_winamax_regular_table_update(update)
             return
 
         if update.hand_id not in self._ff_started:
@@ -1220,6 +2128,8 @@ class HudMain(QObject):
         if found is None:
             return
         temp_key, hud = found
+        # What the idle sweep measures staleness against.
+        self._ff_last_activity[temp_key] = time.monotonic()
 
         if update.finished:
             # The hand is over, or the hero folded and was moved on. Either way
@@ -1228,6 +2138,12 @@ class HudMain(QObject):
             reason = "hero folded, moving on" if update.hero_left else "hand over"
             self._clear_fast_fold_table(temp_key, hud, update.hand_id, reason)
             return
+
+        last_hand = getattr(hud, "ff_last_hand_id", None)
+        if last_hand != update.hand_id:
+            setattr(hud, "ff_last_hand_id", update.hand_id)
+            if getattr(hud, "stat_dict", None) or getattr(hud, "seat_players", None):
+                self._clear_fast_fold_table(temp_key, hud, update.hand_id, "new hand start")
 
         max_seats = getattr(hud, "max", 6) or 6
         engine = FastFoldEngine(config=self.config)
@@ -1244,16 +2160,36 @@ class HudMain(QObject):
         # fraction of a second before the next read corrects them.
         drawn = self.HERO_SLOT in slots
         if drawn and len(slots) >= self.MIN_PLAYERS_TO_SHOW:
-            # Slot 0 is the bottom chair, which is the one the hero is pinned to.
-            seat_map = {((slot + hero_seat - 1) % max_seats) + 1: login for slot, login in slots.items()}
+            # Slot 0 is the bottom-center chair where the client draws the hero.
+            # Map slot 0 to the layout anchor seat (seat 3 for 6-max Winamax layouts).
+            anchor_seat = engine._anchor_slot(hud) or 3
+            seat_map = {((slot + anchor_seat - 1) % max_seats) + 1: login for slot, login in slots.items()}
             source = "window"
-        elif slots:
+        elif slots and not self._ax_reads_spent(hud, update.hand_id):
             # Either the window holds nobody but the hero -- between hands, or
             # waiting for players -- or it was caught half-drawn. Either way
             # there is no table to describe yet; the rechecks will come back.
             self._clear_fast_fold_table(temp_key, hud, update.hand_id, "table not dealt yet")
             return
         elif update.ring and update.hero:
+            hand_start_time = self._ff_started.get(update.hand_id, 0)
+            elapsed = time.monotonic() - hand_start_time if hand_start_time else 1.0
+            if len(update.ring) < max_seats and elapsed * 1000 < self._fast_fold_seat_wait_ms:
+                # The client log names a player only once they have acted, so a
+                # six-handed table is named over several seconds. Showing what is
+                # known so far means blocks appearing one at a time; waiting means
+                # they appear together, later. Which of the two is worse is the
+                # player's call, not ours -- hud_ui/@fast_fold_seat_wait_ms.
+                #
+                # And something has to come back at the deadline. The only other
+                # rechecks of a hand are AX_RECHECK_DELAYS_MS, which stop at
+                # 1500ms: with the wait set beyond that, as the setting documents,
+                # a short-handed table whose last ring update lands before the
+                # deadline would never be drawn at all -- nothing would look
+                # again until the hand was over, and then it is cleared.
+                # Reported by Codex on the pull request.
+                self._schedule_seat_wait_recheck(update, elapsed)
+                return
             seat_map = build_seat_map(update.ring, update.hero, max_seats=max_seats, hero_seat=hero_seat)
             source = "log-ring"
         else:
@@ -1272,39 +2208,198 @@ class HudMain(QObject):
             f"table={temp_key} source={source} hero_seat={hero_seat} "
             f"seats={ {s: seat_map[s] for s in sorted(seat_map)} }",
         )
-        # Reading the stats needs the real connection, which lives on the worker
-        # thread; the seats come back through fast_fold_stats_ready.
+        self._request_fast_fold_stats_coalesced(temp_key, hud, seat_map, update.hand_id)
+
+    def _request_fast_fold_stats_coalesced(
+        self,
+        temp_key: str,
+        hud: Hud.Hud,
+        seat_map: dict[int, str],
+        hand_id: Any,
+    ) -> None:
+        """Ask now if nothing was asked recently, otherwise merge into one later ask.
+
+        The client log names a player only once they have acted, so a six-handed
+        table grows its ring a name at a time. Every growth used to be its own
+        request, database round trip and redraw -- fourteen of them in a single
+        hand across two tables, in a measured session, each one repainting
+        blocks the player was already reading.
+
+        Leading edge, then trailing: the first seat map of a burst goes out
+        immediately, so the blocks appear as early as they ever did. The ones
+        chasing it inside FF_STATS_COALESCE_MS are held, and only the newest
+        survives to be sent when the window closes -- an intermediate ring that
+        was already superseded is not worth a round trip.
+        """
+        now = time.monotonic()
+        last = self._ff_last_request_at.get(temp_key)
+        elapsed_ms = float("inf") if last is None else (now - last) * 1000
+
+        if elapsed_ms >= self.FF_STATS_COALESCE_MS:
+            self._ff_last_request_at[temp_key] = now
+            self._ff_coalesced.pop(temp_key, None)
+            self._request_fast_fold_stats(temp_key, hud, seat_map, hand_id)
+            return
+
+        self._ff_coalesced[temp_key] = (hud, seat_map, hand_id)
+        timer = self._ff_coalesce_timers.get(temp_key)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda key=temp_key: self._flush_coalesced_fast_fold_stats(key))
+            self._ff_coalesce_timers[temp_key] = timer
+        if not timer.isActive():
+            timer.start(max(0, int(self.FF_STATS_COALESCE_MS - elapsed_ms)))
+        self._ff_trace(hand_id, "stats-coalesced", f"table={temp_key} seats={len(seat_map)}")
+
+    def _flush_coalesced_fast_fold_stats(self, temp_key: str) -> None:
+        """Send the newest seat map held back for this table, if it still applies."""
+        held = self._ff_coalesced.pop(temp_key, None)
+        if held is None:
+            return
+        hud, seat_map, hand_id = held
+        current = self.hud_dict.get(temp_key)
+        if current is None or current is not hud:
+            # The table was cleared or rebuilt while the map waited; the request
+            # would be answered against a HUD nobody is looking at.
+            return
+        self._ff_last_request_at[temp_key] = time.monotonic()
+        self._request_fast_fold_stats(temp_key, current, seat_map, hand_id)
+
+    def _forget_window_seat_state(self, table_key: str, hwnd: int | None = None) -> None:
+        """Drop what was learned about reading a table, when that table retires.
+
+        The breaker's verdict, the fruitless count and the per-hand ring are all
+        keyed by the table's name, which a pool hands back: close a table and
+        Winamax gives the next one the same "Colorado 3", so a HUD built after a
+        restart inherited "this client will not answer" from a client that is no
+        longer running. It never read its window, never asked for accessibility,
+        and went straight to the log-derived seats for the rest of the session.
+
+        The accessibility cache was taught the same lesson one round earlier, by
+        the owning process rather than by the key -- and I said in reply that
+        these were safe because they are keyed by name rather than by handle.
+        That was the reason they are not. Reported by Codex on the pull request.
+        """
+        learned = getattr(self, "_table_reads", None)
+        if learned is not None:
+            learned.pop(table_key, None)
+
+        # And the window's own: whether its accessibility request was accepted,
+        # whether one is in the air, and where its table's centre was measured.
+        # Nothing released that in production, so a handle Winamax handed to
+        # another of its tables -- same process, so the owner check says nothing
+        # -- inherited an accepted request it never received, an outstanding one
+        # nobody would ever clear, and a centre belonging to a table that had
+        # closed. Reported by Codex on the pull request.
+        if hwnd:
+            with contextlib.suppress(Exception):
+                from fpdb_3_legacy.winamax_ax_seats import forget_window_state
+
+                forget_window_state(int(hwnd))
+
+    def _forget_coalesced_fast_fold_stats(self, temp_key: str) -> None:
+        """Drop anything held for a table that is going away.
+
+        Reached through _clear_fast_fold_table, which is called on HUDs built
+        without the full constructor -- so the state is asked for the same
+        defensive way its neighbours in that method are, rather than assumed.
+        """
+        for name in ("_ff_coalesced", "_ff_last_request_at"):
+            held = getattr(self, name, None)
+            if held is not None:
+                held.pop(temp_key, None)
+        timers = getattr(self, "_ff_coalesce_timers", None)
+        timer = None if timers is None else timers.pop(temp_key, None)
+        if timer is not None:
+            with contextlib.suppress(RuntimeError):
+                timer.stop()
+                timer.deleteLater()
+
+    def _request_fast_fold_stats(
+        self,
+        temp_key: str,
+        hud: Hud.Hud,
+        seat_map: dict[int, str],
+        hand_id: Any,
+    ) -> None:
+        """Ask the worker for the seated players' statistics.
+
+        Reading them needs the real connection, which lives on the worker
+        thread; the answer comes back through ``fast_fold_stats_ready``. The
+        request carries the site and pool as well as a reference hand, because
+        a table the client log named before any of its hands was imported has
+        no hand of its own and would otherwise get no statistics at all.
+        """
         worker = getattr(self, "_db_worker", None)
         if worker is None:
-            self._ff_trace(update.hand_id, "stats-skipped", "no database worker")
+            self._ff_trace(hand_id, "stats-skipped", "no database worker")
             return
-        self._ff_pending_hand[temp_key] = update.hand_id
-        self._ff_trace(update.hand_id, "stats-requested", f"table={temp_key}")
+        request_id = self._next_fast_fold_request_id()
+        self._ff_pending_hand[temp_key] = hand_id
+        self._ff_pending_request[temp_key] = request_id
+        # The generation this read belongs to. A HUD destroyed and rebuilt
+        # while the worker is busy gets a new one, and the answer to the old
+        # request must not be painted onto the replacement's windows.
+        self._ff_pending_generation[temp_key] = getattr(hud, "_fpdb_generation", None)
+        reference_hand = self._stats_reference_hand(temp_key)
+        self._ff_trace(
+            hand_id,
+            "stats-requested",
+            f"table={temp_key} window_id={getattr(getattr(hud, 'table', None), 'number', None)} "
+            f"generation={self._ff_pending_generation[temp_key]} request={request_id} "
+            f"reference_hand={reference_hand}",
+        )
         worker.submit(
             FastFoldStatsRequest(
                 temp_key=temp_key,
                 seat_map=seat_map,
-                hand_id=self._stats_reference_hand(temp_key),
+                hand_id=reference_hand,
+                site_name=getattr(getattr(hud, "table", None), "site", "") or "Winamax",
+                pool_name=self._pool_name(temp_key),
                 num_seats=getattr(hud, "max", 6) or 6,
+                request_id=request_id,
             ),
         )
+
+    @staticmethod
+    def _pool_name(temp_key: str) -> str:
+        """The table name a hand history records, taken back out of a HUD key.
+
+        A Fast-Fold HUD key is the pool plus the client's window index plus the
+        native window id ("Casablanca 5 #61825"); the hands themselves are
+        written under the bare pool name. Stripping both suffixes is what lets
+        the worker find a hand of this pool when the table has none of its own.
+        """
+        return re.sub(r"\s+\d+$", "", re.sub(r"\s*#\d+$", "", temp_key)).strip()
 
     def _stats_reference_hand(self, temp_key: str) -> Any:
         """A hand to take the gametypeId from when reading live player stats.
 
         This table's own last hand, when it has one. A window that has not had a
-        hand imported yet would otherwise get no gametypeId, the stats aggregate
-        would be skipped, and every seat would read "NA" -- so fall back to
-        another window on the same pool, which plays the same game for the same
-        stakes.
+        hand imported yet may use another window from the same pool, which is
+        still narrower than guessing from the newest global Gametypes row.
+
+        None when nothing has been imported yet -- the first table of a
+        session. The worker then resolves the gametypeId from the pool's own
+        last hand instead; see ``get_last_gametype_id_for_table``.
         """
         hand_id = self._last_processed_hands.get(temp_key)
         if hand_id is not None:
             return hand_id
 
-        base = re.sub(r"\s+\d+$", "", temp_key)
+        aliases = getattr(self, "_fast_fold_aliases", {})
+        for imported_key, live_key in aliases.items():
+            if live_key == temp_key:
+                hand_id = self._last_processed_hands.get(imported_key)
+                if hand_id is not None:
+                    return hand_id
+
+        clean_key = re.sub(r"\s*#\d+$", "", temp_key)
+        base = re.sub(r"\s+\d+$", "", clean_key)
         for other_key, other_hand in self._last_processed_hands.items():
-            if re.sub(r"\s+\d+$", "", other_key) == base:
+            clean_other = re.sub(r"\s*#\d+$", "", other_key)
+            if re.sub(r"\s+\d+$", "", clean_other) == base:
                 return other_hand
         return None
 
@@ -1319,24 +2414,42 @@ class HudMain(QObject):
         the caller then falls back to the log-derived ring.
         """
         reader = getattr(self, "winamax_ax_seats", None)
-        title = getattr(getattr(hud, "table", None), "title", "") or ""
-        if reader is None or not title:
+        table = getattr(hud, "table", None)
+        title = getattr(table, "title", "") or ""
+        if reader is None or not title or not self._ax_reader_enabled:
             return {}
 
-        cached_hand, cached_slots, reads = self._ax_rings.get(title, (None, {}, 0))
-        if cached_hand != hand_id:
-            cached_slots, reads = {}, 0
+        table_key = getattr(table, "key", None) or title
+        state = self._table_reads.get(table_key)
+        if state is not None and state.gave_up:
+            return {}
+        if state is None:
+            state = self._table_reads.setdefault(table_key, TableReadState())
+        state.start_hand(hand_id)
+        cached_slots, reads = state.ring, state.reads
 
         # The hand-start line beats the client to the draw: read then and only
         # the hero is on the table yet. So keep re-reading on later lines of the
         # same hand, taking the fullest answer, until the table is full or the
         # budget runs out -- caching that first partial read is what left the
         # overlay showing one player for a whole hand.
-        if len(cached_slots) >= max_seats or reads >= self.AX_READS_PER_HAND:
+        if (self.HERO_SLOT in cached_slots and len(cached_slots) >= max_seats - 1) or len(cached_slots) >= max_seats or reads >= self.AX_READS_PER_HAND:
             return cached_slots
 
+        table_pos = None
+        if table is not None and getattr(table, "x", None) is not None and getattr(table, "y", None) is not None:
+            table_pos = (float(table.x), float(table.y))
+
         started = time.monotonic()
-        slots = reader.read_window(title, max_seats)
+        # The window id is the table's identity: every window of a Fast-Fold
+        # pool carries the same name, and resolving one by title again -- on
+        # every read of every hand -- means enumerating the whole desktop.
+        slots = reader.read_window(
+            title,
+            max_seats,
+            table_pos=table_pos,
+            window_id=getattr(table, "number", None),
+        )
         took = (time.monotonic() - started) * 1000
         # A read holding the hero's chair beats one without it even when the
         # one without it names more players: the second caught the window
@@ -1345,24 +2458,94 @@ class HudMain(QObject):
             (cached_slots, slots),
             key=lambda answer: (self.HERO_SLOT in answer, len(answer)),
         )
-        self._ax_rings[title] = (hand_id, best, reads + 1)
+        state.ring, state.reads = best, reads + 1
 
-        if slots != cached_slots:
-            empty = sorted(set(range(max_seats)) - set(best))
-            self._ff_trace(
-                hand_id,
-                "window-read",
-                f"{title!r} {took:.0f}ms read#{reads + 1} players={len(best)} "
-                f"slots={ {s: best[s] for s in sorted(best)} } empty={empty}",
-            )
+        # Traced on every read, not only when the answer changed. A reader that
+        # returns nothing returns the same nothing every time, so the one case
+        # worth reporting -- the window telling us about no players at all, for
+        # every hand of a session -- was the one case that logged absolutely
+        # nothing, even with FPDB_HUD_TRACE=1. The seats then come from the log
+        # ring, which names a player only once they have acted, and the blocks
+        # arrive one at a time; that is what gets reported, with no trace of why.
+        # A client that publishes nothing publishes nothing every time, and each
+        # read is a synchronous walk of another process's tree on the GUI
+        # thread, at hand-start, which is exactly when the HUD is trying to
+        # draw. Measured on a live session: six reads a hand, on two tables,
+        # 15-62ms each, every one of them players=0. Stop paying for it.
+        # Fruitless means "could not be acted on", not "came back empty". This
+        # counted empty reads, and a client that answers with the hero and one
+        # neighbour -- never the bottom-centre chair, never enough of the ring --
+        # answers non-empty every single time. The counter reset on every read,
+        # the breaker never tripped, and six reads a hand went on being paid for
+        # on two tables at 94-172ms each: about 1.5s of GUI thread per hand, for
+        # a seat map the caller discards. The test is the caller's own.
+        usable = self.HERO_SLOT in best and len(best) >= self.MIN_PLAYERS_TO_SHOW
+        if usable:
+            state.fruitless = 0
+        else:
+            state.fruitless += 1
+            fruitless = state.fruitless
+            if fruitless >= self.AX_FRUITLESS_READS_BEFORE_GIVING_UP:
+                state.gave_up = True
+                log.warning(
+                    "Giving up on the window seat reader for %s after %d reads that could not seat "
+                    "anyone: this client is not publishing enough of that table through the "
+                    "accessibility API to place the hero. Its Fast-Fold seats come from the client "
+                    "log, which names a player only once they have acted.",
+                    table_key,
+                    fruitless,
+                )
+
+        empty = sorted(set(range(max_seats)) - set(best))
+        self._ff_trace(
+            hand_id,
+            "window-read",
+            f"{title!r} (key={table_key}) {took:.0f}ms read#{reads + 1} players={len(best)} "
+            f"slots={ {s: best[s] for s in sorted(best)} } empty={empty}",
+        )
         return best
+
+    def _ax_reads_spent(self, hud: Hud.Hud, hand_id: str) -> bool:
+        """Whether this hand's budget of window reads is used up for this table.
+
+        Once it is, re-reading cannot improve the answer within this hand, so a
+        window read that never showed a dealt table has said all it is going to
+        say -- and the log-derived ring, slow as it is, describes the table
+        better than nothing. Without this, a client that answers the
+        accessibility API only partially (or not at all, while still yielding a
+        label or two) would leave the overlay permanently blank, which is worse
+        than the ring it replaced.
+        """
+        table = getattr(hud, "table", None)
+        table_key = getattr(table, "key", None) or getattr(table, "title", "") or ""
+        state = self._table_reads.get(table_key)
+        return state is not None and state.hand_id == hand_id and state.reads >= self.AX_READS_PER_HAND
 
     def _on_fast_fold_stats(self, result: FastFoldStatsResult) -> None:
         """Apply stats the worker read for a Fast-Fold table. Runs on the GUI thread."""
         hand_id = self._ff_pending_hand.get(result.temp_key, "?")
+        expected_request = getattr(self, "_ff_pending_request", {}).get(result.temp_key)
+        if expected_request is None or result.request_id != expected_request:
+            self._ff_trace(
+                hand_id,
+                "stats-dropped",
+                f"table={result.temp_key} stale_request={result.request_id} expected={expected_request}",
+            )
+            return
         hud = self.hud_dict.get(result.temp_key)
         if hud is None:
             self._ff_trace(hand_id, "stats-dropped", f"table={result.temp_key} has no HUD any more")
+            return
+
+        requested_generation = getattr(self, "_ff_pending_generation", {}).get(result.temp_key)
+        current_generation = getattr(hud, "_fpdb_generation", None)
+        if requested_generation is not None and requested_generation != current_generation:
+            # The HUD was torn down and rebuilt while this read was in flight.
+            self._ff_trace(
+                hand_id,
+                "stats-dropped",
+                f"table={result.temp_key} stale_generation={requested_generation} now={current_generation}",
+            )
             return
 
         applied = FastFoldEngine.apply_seats(hud, result.seat_map, result.stat_dict)
@@ -1385,7 +2568,18 @@ class HudMain(QObject):
         reader = getattr(self, "winamax_log_reader", None)
         return bool(reader is not None and reader.is_tailing)
 
-    def _qualify_fast_fold_table(self, info: TableInfo, hand_id: Any) -> TableInfo | None:
+    def _next_import_request_id(self) -> int:
+        """Return a process-local id for the next imported-hand application.
+
+        Paired with the hand id and the window id in the "FF import applied"
+        line, this is what distinguishes one hand applied once from the same
+        hand applied twice: two applications carry two request ids.
+        """
+        request_id = int(getattr(self, "_import_request_sequence", 0)) + 1
+        self._import_request_sequence = request_id
+        return request_id
+
+    def _qualify_fast_fold_table(self, info: TableInfo, hand_id: Any) -> FastFoldQualification | None:
         """Qualify a Fast-Fold table name with the client window it was played on.
 
         Every Escape window on a pool writes its hands under the pool's name
@@ -1402,9 +2596,17 @@ class HudMain(QObject):
 
         The hand's site id comes from the snapshot rather than a query: by the
         time this runs, ``db_connection`` is the database-free replay facade.
+
+        This decides and says nothing. It runs once for the identity-only
+        snapshot and again for the final one, and it used to announce "FF
+        import: hand X -> window N" both times -- before the idempotence check
+        that stops the second one from being applied. Two lines for one
+        applied hand is what made the logs read like a double update. The
+        announcement now lives at the point the hand is really applied; see
+        :meth:`_log_fast_fold_import_applied`.
         """
         if not info.fast or not self._has_live_seat_source(info.site_name):
-            return info
+            return FastFoldQualification(info=info, table_no=None, site_hand_no=None)
 
         prepared = self._prepared_hands.get(str(hand_id))
         # The identity-only snapshot carries site_hand_no and nothing else, so
@@ -1412,54 +2614,102 @@ class HudMain(QObject):
         site_hand_no = getattr(prepared, "site_hand_no", None) or getattr(
             getattr(prepared, "hand_instance", None), "handid", None
         )
-        table_no = self.winamax_log_reader.table_no_for_hand(site_hand_no) if site_hand_no else None
+        log_reader = getattr(self, "winamax_log_reader", None)
+        table_no = log_reader.table_no_for_hand(site_hand_no) if log_reader is not None and site_hand_no else None
         if not table_no:
             # WARNING because this is what delays a table's HUD by a hand or two
-            # at startup, and the delay is otherwise invisible.
-            log.warning(
-                "FF import: hand %s (site id %s) is not in the log window map, so which window "
-                "it was played on is unknown; skipping it rather than keying a HUD on the bare "
-                "pool name %r. The next hand on that window carries the mapping.",
-                hand_id,
-                site_hand_no,
-                info.table_name,
-            )
+            # at startup, and the delay is otherwise invisible. Said once per
+            # hand: the identity-only and final snapshots both come through here.
+            if str(hand_id) not in self._ff_unmapped_logged:
+                self._ff_unmapped_logged.add(str(hand_id))
+                if len(self._ff_unmapped_logged) > self.FF_UNMAPPED_LOG_MEMORY:
+                    self._ff_unmapped_logged.clear()
+                log.warning(
+                    "FF import: hand %s (site id %s) is not in the log window map, so which window "
+                    "it was played on is unknown; skipping it rather than keying a HUD on the bare "
+                    "pool name %r. The next hand on that window carries the mapping.",
+                    hand_id,
+                    site_hand_no,
+                    info.table_name,
+                )
             return None
 
-        log.warning(
-            "FF import: hand %s (site id %s) -> window %s, table %r",
-            hand_id,
-            site_hand_no,
-            table_no,
-            f"{info.table_name} {table_no}",
-        )
         # This hand settles what the pool deals, which is the one thing the log
         # cannot say. Kept so later hands on this pool -- and later sessions --
         # can build their HUD from the log alone.
-        self.winamax_pool_games.remember(info.table_name, info.poker_game)
-        return info._replace(table_name=f"{info.table_name} {table_no}")
+        pool_games = getattr(self, "winamax_pool_games", None)
+        if pool_games is not None:
+            pool_games.remember(info.table_name, info.poker_game)
+        return FastFoldQualification(
+            info=info._replace(table_name=f"{info.table_name} {table_no}"),
+            table_no=table_no,
+            site_hand_no=site_hand_no,
+        )
+
+    def _log_fast_fold_import_applied(self, hand_id: Any, temp_key: str) -> None:
+        """Announce an imported Fast-Fold hand at the moment it is applied.
+
+        Carries ``(hand_id, window_id, request_id)`` so two lines for one hand
+        can be told apart from one line for each of two hands -- the question
+        the previous logging could not answer.
+        """
+        hud = self.hud_dict.get(temp_key)
+        log.warning(
+            "FF import applied: hand=%s table=%r window_id=%s request=%s generation=%s",
+            hand_id,
+            temp_key,
+            getattr(getattr(hud, "table", None), "number", None),
+            self._next_import_request_id(),
+            getattr(hud, "_fpdb_generation", None),
+        )
 
     def _hud_is_fast_fold(self, hud: Hud.Hud, temp_key: str = "") -> bool:
         """Whether this table plays the Fast-Fold format.
 
-        Checked in order of reliability: the imported hand's game type, a pool
-        seen in the Winamax log, then the window title. The title only helps on
-        sites that name the format in it -- Winamax Escape tables do not.
+        Checked in order of reliability: active fast fold tables, base table
+        names with matching table indices, imported hand game types, then window titles.
         """
-        if temp_key and temp_key in self._fast_fold_tables:
-            return True
-        # Explicit True only: a stand-in object answers every attribute, and
-        # "probably fast-fold" would quietly switch off the ordinary refresh.
         if getattr(hud, "is_fast_fold", False) is True:
             return True
-        # Only real strings: the title match is a regex, and a stand-in object
-        # hands back something that is neither a name nor empty.
+        if temp_key and temp_key in self._fast_fold_tables:
+            hud.is_fast_fold = True
+            return True
+
+        resolved_key = self._resolve_fast_fold_key(temp_key) if temp_key else temp_key
+        if resolved_key and resolved_key != temp_key and resolved_key in self.hud_dict:
+            hud.is_fast_fold = True
+            return True
+
+        clean_key = re.sub(r"\s*#\d+$", "", temp_key or "")
+        hud_table_name = getattr(hud, "table_name", None) or ""
+        clean_hud_name = re.sub(r"\s*#\d+$", "", hud_table_name if isinstance(hud_table_name, str) else "")
+
+        for ff_table in list(self._fast_fold_tables):
+            clean_ff = re.sub(r"\s*#\d+$", "", ff_table)
+            for check in (clean_key, clean_hud_name):
+                if not check:
+                    continue
+                if check == clean_ff:
+                    hud.is_fast_fold = True
+                    return True
+                m1 = re.search(r"(\d+)\s*$", check)
+                m2 = re.search(r"(\d+)\s*$", clean_ff)
+                if m1 and m2 and m1.group(1) == m2.group(1):
+                    b1 = re.sub(r"\s*\d+$", "", check)
+                    b2 = re.sub(r"\s*\d+$", "", clean_ff)
+                    if b1 in b2 or b2 in b1:
+                        hud.is_fast_fold = True
+                        return True
+
         table_name = getattr(hud, "table_name", None)
         game_type = getattr(hud, "game_type", None)
-        return is_fast_fold_table(
+        is_ff = is_fast_fold_table(
             table_name if isinstance(table_name, str) and table_name else temp_key,
             game_type=game_type if isinstance(game_type, str) else "",
         )
+        if is_ff:
+            hud.is_fast_fold = True
+        return is_ff
 
     def _ensure_fast_fold_hud(self, update: Any) -> tuple[str, Hud.Hud] | None:
         """Create the HUD for a Fast-Fold window the log has just reported.
@@ -1480,7 +2730,7 @@ class HudMain(QObject):
             self._ff_trace(
                 update.hand_id,
                 "create-deferred",
-                "macOS accessibility reader unavailable; waiting for an imported hand",
+                "Winamax table resolver unavailable; waiting for an imported hand",
             )
             return None
 
@@ -1493,13 +2743,37 @@ class HudMain(QObject):
                 f"waiting for an imported hand",
             )
             return None
-        temp_key = window.table_name
-        if temp_key in self.hud_dict:
+        if window.window_id is not None:
+            temp_key = f"{window.table_name} #{window.window_id}"
+        else:
+            temp_key = window.table_name
+        aliases = getattr(self, "_fast_fold_aliases", None)
+        if aliases is not None:
+            aliases[window.table_name] = temp_key
+        if temp_key in self.hud_dict and not self._discard_loading_hud(temp_key, update.hand_id):
             return temp_key, self.hud_dict[temp_key]
+
+        # The table title is not unique in Fast-Fold.  The native window id is
+        # the stable identity, so reuse a HUD already attached to that window
+        # even if an earlier resolver pass produced a different text key.
+        existing = self._find_hud_by_window_id(window.window_id)
+        if existing is not None:
+            existing_key, existing_hud = existing
+            if not self._discard_loading_hud(existing_key, update.hand_id):
+                if aliases is not None:
+                    aliases[window.table_name] = existing_key
+                existing_hud.is_fast_fold = True
+                self._ff_trace(
+                    update.hand_id,
+                    "hud-reused",
+                    f"table={existing_key} window={window.title!r} window_id={window.window_id}",
+                )
+                return existing_key, existing_hud
 
         # The window states the game only when the accessibility API answered.
         # Otherwise fall back on what an imported hand from this pool proved.
-        poker_game = window.poker_game or self.winamax_pool_games.get(temp_key)
+        pool_games = getattr(self, "winamax_pool_games", None)
+        poker_game = window.poker_game or (pool_games.get(temp_key) or pool_games.get(window.table_name) if pool_games is not None else None)
         if not poker_game:
             self._ff_trace(
                 update.hand_id,
@@ -1529,6 +2803,9 @@ class HudMain(QObject):
         # A full HUD, not the loading placeholder: that one has no aux windows,
         # so it can only ever show "Loading HUD..." until an import replaces it.
         # The seats arrive from the window moments later.
+        create_kwargs: dict[str, Any] = {"stats": {}}
+        if window.window_id is not None:
+            create_kwargs["resolved_window"] = window
         self._create_new_hud(
             synthetic_hand,
             temp_key,
@@ -1536,7 +2813,7 @@ class HudMain(QObject):
             self._winamax_site_id,
             self.FAST_FOLD_MAX_SEATS,
             "Winamax",
-            stats={},
+            **create_kwargs,
         )
         hud = self.hud_dict.get(temp_key)
         if hud is None:
@@ -1550,6 +2827,41 @@ class HudMain(QObject):
             f"table={temp_key} window={window.title!r} game={poker_game} (from the log, no import needed)",
         )
         return temp_key, hud
+
+    def _discard_loading_hud(self, temp_key: str, hand_id: Any) -> bool:
+        """Tear down a loading placeholder so a real HUD can take its window.
+
+        The placeholder an imported hand puts up has ``loading=True``, and
+        ``idle_create`` returns from that before building a single aux window
+        -- it exists to show "Loading HUD..." and nothing else. Adopting it
+        because it holds the right native window, which is what the
+        duplicate-renderer guard would otherwise do, leaves the live log
+        writing seats into a HUD that has no windows to draw them in: the
+        table stays on "Loading HUD..." for as long as it is open.
+
+        Returns whether a placeholder was discarded, in which case the caller
+        must go on and create the real HUD.
+        """
+        hud = self.hud_dict.get(temp_key)
+        if hud is None or not getattr(hud, "is_loading", False):
+            return False
+        self._ff_trace(
+            hand_id,
+            "loading-replaced",
+            f"table={temp_key} had no overlay windows; building the real HUD from the log",
+        )
+        self.idle_kill(temp_key)
+        return temp_key not in self.hud_dict
+
+    def _find_hud_by_window_id(self, window_id: Any) -> tuple[str, Hud.Hud] | None:
+        """Return the HUD attached to ``window_id``, if one is already alive."""
+        if window_id is None:
+            return None
+        for key, hud in self.hud_dict.items():
+            table = getattr(hud, "table", None)
+            if getattr(table, "number", None) == window_id:
+                return key, hud
+        return None
 
     def _find_fast_fold_hud(self, update: Any) -> tuple[str, Hud.Hud] | None:
         """Match a log pool to an open Winamax HUD.
@@ -1634,13 +2946,88 @@ class HudMain(QObject):
 
     def _handle_table_status(self, hud: Hud.Hud) -> None:
         """Handle status changes for a single table."""
-        status = hud.table.check_table()
+        table = getattr(hud, "table", None)
+        if table is None:
+            # Preview and lightweight test HUDs can intentionally omit the
+            # live table object. They must not break the shared status timer.
+            return
+        status = table.check_table()
         if status == "client_destroyed":
             self.client_destroyed(None, hud)
         elif status == "client_moved":
             self.client_moved(None, hud)
         elif status == "client_resized":
             self.client_resized(None, hud)
+        elif getattr(table, "type", "") == "tour":
+            self._handle_tour_table_switch(hud, table)
+
+    def _log_table_not_found(
+        self,
+        temp_key: str,
+        table_name: str,
+        db_site: str,
+        hud_site: str,
+        tablewindow: Any,
+    ) -> None:
+        """Report a table whose window could not be found, at the right volume.
+
+        A hand reaches the HUD 15 to 30 seconds after it was played, so the last
+        hands of a table that has just been closed -- and every hand of a Sit'n'Go
+        whose file the client only writes once the match is over -- routinely
+        arrive with no window left to attach to. Logged as errors, and once per
+        hand, they buried the case that is a real failure: a table that is open
+        on screen and never gets a HUD. That one still logs an error, once, with
+        the search string it failed on, which is the part that identifies why.
+        """
+        if temp_key in self._tables_attached:
+            report = log.info  # window was found before: the table has since closed
+        elif temp_key in self._tables_not_found:
+            report = log.debug  # already reported once for this table
+        else:
+            report = log.error
+        self._tables_not_found.add(temp_key)
+        report(
+            "HUD create: table name %s not found for db_site=%s hud_site=%s (searched %r), skipping.",
+            table_name,
+            db_site,
+            hud_site,
+            getattr(tablewindow, "search_string", ""),
+        )
+
+    def _handle_tour_table_switch(self, hud: Hud.Hud, table: Any) -> None:
+        """Kill a tournament HUD whose window has moved on to another table.
+
+        check_table() only watches geometry, so a window that keeps its size and
+        position while its title changes table went unnoticed until a hand of the
+        new table was imported -- 15 to 30 seconds later on a Twister, where the
+        client reuses the same window for the next match of the series. Until
+        then the finished tournament's HUD sat on the new table showing the
+        previous opponents. Killing it here means the worst case is no HUD for a
+        few seconds instead of a wrong one.
+        """
+        try:
+            seen = table.get_table_no()
+        except Exception:
+            log.debug("Table title check failed for %r", getattr(table, "key", "?"), exc_info=True)
+            return
+        if seen is False:
+            return
+        # The number the title carried when the HUD attached is the baseline, so
+        # a site whose title never shows the table id simply never signals here
+        # instead of the HUD being killed on a mismatch it cannot control.
+        baseline = getattr(table, "title_table_no", None)
+        if baseline is None:
+            table.title_table_no = seen
+            return
+        if seen != baseline:
+            log.warning(
+                "HUD dropped: window %s left table %s (title now shows table %s, was %s)",
+                table.number,
+                table.key,
+                seen,
+                baseline,
+            )
+            self.table_is_stale(hud)
 
     def _topify_mac_windows(self) -> None:
         """Bring all HUD windows to the top on macOS."""
@@ -1838,8 +3225,72 @@ class HudMain(QObject):
         log.info("Table %s rebuilt with HUD profile %s", getattr(hud, "table_name", "?"), stat_set.name)
 
     def create_HUD(self, args: HUDCreationArgs) -> None:
-        """Create a new HUD for a table."""
+        """Create a new HUD for a table.
+
+        Refuses outright to put a second renderer on a window that already has
+        one, and destroys the previous generation when a window's HUD key
+        changes. Both cases are what a player sees as doubled overlays, and
+        both are decided here rather than at each of the callers that can
+        reach this method.
+        """
         log.debug("Creating HUD for table %s and hand %s", args.temp_key, args.new_hand_id)
+        window_id = getattr(args.table, "number", None)
+        claim = self._window_registry.claim(window_id, args.temp_key)
+        if claim.outcome is ClaimOutcome.DUPLICATE:
+            log.warning(
+                "HUD create refused: window %s already renders table %r at generation %s "
+                "(session=%s pid=%s hand=%s)",
+                window_id,
+                args.temp_key,
+                claim.generation,
+                session_id(),
+                os.getpid(),
+                args.new_hand_id,
+            )
+            return
+        if claim.outcome is ClaimOutcome.SUPERSEDED and claim.superseded is not None:
+            log.warning(
+                "HUD create supersedes table %r on window %s (generation %s -> %s); "
+                "destroying the previous renderer first",
+                claim.superseded.temp_key,
+                window_id,
+                claim.superseded.generation,
+                claim.generation,
+            )
+            self._destroy_superseded_hud(claim.superseded.temp_key)
+
+        self._hud_generation = claim.generation
+        # What this key held before the attempt. A build that fails must leave
+        # it exactly there: the same key can already have a live HUD on an
+        # earlier window of the same table, and that HUD is none of this
+        # attempt's business.
+        previous_hud = self.hud_dict.get(args.temp_key)
+        try:
+            self._build_claimed_hud(args, window_id)
+        except Exception:
+            # The window is claimed before the HUD is built, so a build that
+            # raises leaves the claim behind -- and every later hand for this
+            # table is then refused as a duplicate, which makes one failure
+            # permanent and silent. Hand back the window *this attempt*
+            # claimed, and let the error travel on to its usual handler.
+            self._window_registry.release_registration(claim.registration)
+            if previous_hud is None:
+                self.hud_dict.pop(args.temp_key, None)
+            else:
+                self.hud_dict[args.temp_key] = previous_hud
+            log.warning(
+                "HUD create failed for table %r on window %s; released the window so the next hand can retry",
+                args.temp_key,
+                window_id,
+            )
+            raise
+
+    def _build_claimed_hud(self, args: HUDCreationArgs, window_id: Any) -> None:
+        """Build the HUD for a window this caller has already claimed.
+
+        Separate from ``create_HUD`` only so that the claim can be undone as a
+        whole when any part of the build fails.
+        """
         self.hud_dict[args.temp_key] = Hud.Hud(
             self,
             args.table,
@@ -1853,6 +3304,12 @@ class HudMain(QObject):
         self.hud_dict[args.temp_key].stat_dict = args.stat_dict
         self.hud_dict[args.temp_key].cards = args.cards
         self.hud_dict[args.temp_key].max = args.max_seats
+        self.hud_dict[args.temp_key]._fpdb_generation = self._hud_generation
+        # Before idle_create, because the aux windows read this in adj_seats()
+        # when they are built. Setting it afterwards -- which is where every
+        # caller used to set it -- left the seat rotation applied twice.
+        if self._creation_is_fast_fold(args):
+            self.hud_dict[args.temp_key].is_fast_fold = True
 
         args.table.hud = self.hud_dict[args.temp_key]
 
@@ -1863,7 +3320,78 @@ class HudMain(QObject):
                 aw.update_data(args.new_hand_id, self.db_connection)
 
         self.idle_create(args)
+        self._publish_analytics(self.hud_dict[args.temp_key], args.new_hand_id)
+        created = self.hud_dict[args.temp_key]
+        log.info(
+            "HUD created: session=%s pid=%s generation=%s table=%r window_id=%s hand=%s "
+            "profile=%r aux=%s overlays=%s",
+            session_id(),
+            os.getpid(),
+            self._hud_generation,
+            args.temp_key,
+            window_id,
+            args.new_hand_id,
+            getattr(getattr(created, "stat_set", None), "name", None),
+            self._describe_aux_windows(created),
+            self._describe_overlay_win_ids(created),
+        )
         log.debug("HUD for table %s created successfully.", args.temp_key)
+
+    def _creation_is_fast_fold(self, args: HUDCreationArgs) -> bool:
+        """Whether the HUD being created is for a Fast-Fold table.
+
+        Decided from what the caller already knows rather than from the HUD
+        object, because this has to be answered before the HUD's aux windows
+        exist. ``context.speed`` is set by ``_create_new_hud`` for every path;
+        the table set is the fallback for a direct ``create_HUD`` call.
+        """
+        if getattr(args.context, "speed", None) == "fast":
+            return True
+        return args.temp_key in getattr(self, "_fast_fold_tables", set())
+
+    def _destroy_superseded_hud(self, temp_key: str) -> None:
+        """Tear down a HUD whose window has been claimed by another key.
+
+        Goes through the ordinary kill path so the label, the aux windows and
+        the pending Fast-Fold state all go with it; leaving any of them behind
+        is exactly the residual overlay this guard exists to prevent.
+        """
+        if temp_key not in self.hud_dict:
+            self._window_registry.release(temp_key)
+            return
+        self.clear_table_stat_set_override(temp_key)
+        self.idle_kill(temp_key)
+
+    @staticmethod
+    def _describe_aux_windows(hud: Hud.Hud) -> str:
+        """Name the aux window classes attached to a HUD, with their count."""
+        aux_windows = list(getattr(hud, "aux_windows", []) or [])
+        names = ",".join(sorted({type(aux).__name__ for aux in aux_windows})) or "none"
+        return f"{len(aux_windows)}[{names}]"
+
+    @staticmethod
+    def _describe_overlay_win_ids(hud: Hud.Hud) -> str:
+        """List the native window ids of a HUD's own overlay windows.
+
+        This is what tells a second renderer from a redrawn one: two sets of
+        blocks over one table carry two disjoint sets of native ids, while one
+        set painted twice keeps the ids it already had. ``m_windows`` holds the
+        per-seat blocks, ``container`` the single-window aux types.
+        """
+        ids: list[str] = []
+        for aux in list(getattr(hud, "aux_windows", []) or []):
+            name = type(aux).__name__
+            widgets = list((getattr(aux, "m_windows", None) or {}).values())
+            container = getattr(aux, "container", None)
+            if container is not None:
+                widgets.append(container)
+            for widget in widgets:
+                win_id = getattr(widget, "winId", None)
+                if not callable(win_id):
+                    continue
+                with contextlib.suppress(Exception):
+                    ids.append(f"{name}:{int(win_id())}")
+        return ",".join(ids) or "none"
 
     def update_HUD(
         self,
@@ -2068,6 +3596,28 @@ class HudMain(QObject):
 
         return hud_poker_game, None
 
+    def _publish_analytics(self, hud: Any, hand_id: Any) -> None:
+        """Hand a finished batch's analytics values to the table's HUD (#335).
+
+        The values were computed on the worker, so this only stores them on each
+        aux window's session; the seat labels read them on their next refresh.
+        ``aux_windows`` is read defensively because a HUD that is still being
+        built has none yet, and a profile with no analytics cell has no values
+        to store at all.
+        """
+        prepared = self._prepared_hands.get(str(hand_id))
+        values = getattr(prepared, "analytics_values", None)
+        if not values:
+            return
+        for aw in getattr(hud, "aux_windows", None) or ():
+            publish = getattr(aw, "publish_analytics", None)
+            if publish is None:
+                continue
+            try:
+                publish(values)
+            except Exception:  # intentional broad catch: one window must not cost the others theirs
+                log.exception("Could not publish analytics values to %s", type(aw).__name__)
+
     @db_profile.scoped("update_hud")
     def _update_existing_hud(
         self,
@@ -2133,6 +3683,7 @@ class HudMain(QObject):
 
         hud.seat_players = seat_players
         self._set_table_stats(hud, new_hand_id)
+        self._publish_analytics(hud, new_hand_id)
         hud.cards = self.get_cards(new_hand_id, hud.poker_game)
         for aw in hud.aux_windows:
             aw.update_data(new_hand_id, self.db_connection)
@@ -2531,6 +4082,7 @@ class HudMain(QObject):
         *,
         loading: bool = False,
         stats: dict | None = None,
+        resolved_window: Any | None = None,
     ) -> None:
         """Create a new HUD for a table.
 
@@ -2542,7 +4094,15 @@ class HudMain(QObject):
         the database, which is what lets a table be created from the client log
         with no hand behind it -- a full HUD, aux windows and all, on a thread
         that has no database connection.
+
+        ``resolved_window`` is a macOS Fast-Fold window already found at hand
+        start. Passing it through prevents OSXTables from performing a second
+        window scan that can disagree with the first one while TCC is changing.
         """
+        if not resolved_window and self._resolve_fast_fold_key(temp_key) != temp_key:
+            log.info("Skipping legacy HUD creation for %r: live FastFold HUD is already active", temp_key)
+            return
+
         info = TableInfo.coerce(table_info)
         table_name = info.table_name
         max_seats = info.max_seats
@@ -2613,17 +4173,14 @@ class HudMain(QObject):
             "table_number": tab_number,
             "tourney_name": tourney_name,
         }
+        if resolved_window is not None:
+            table_kwargs["resolved_window"] = resolved_window
         tablewindow = self.Tables.Table(self.config, hud_site_name, **table_kwargs)
 
         if tablewindow.number is None:
             if game_type == "tour":
                 table_name = f"{tour_number} {tab_number}"
-            log.error(
-                "HUD create: table name %s not found for db_site=%s hud_site=%s, skipping.",
-                table_name,
-                info.site_name,
-                hud_site_name,
-            )
+            self._log_table_not_found(temp_key, table_name, info.site_name, hud_site_name, tablewindow)
             return
         if tablewindow.number in self.blacklist:
             log.warning(
@@ -2634,10 +4191,15 @@ class HudMain(QObject):
             )
             return
 
-        # One WARNING per HUD creation so the log always records WHICH window
-        # was matched: user reports of "table not detected" are impossible to
-        # diagnose without the matched hwnd/title (or their absence).
-        log.warning(
+        # Record the matched window for diagnostics without treating normal
+        # table discovery as a warning.
+        self._tables_attached.add(temp_key)
+        # Baseline for _handle_tour_table_switch, taken from the title this HUD
+        # was built on rather than from the first poll up to 800 ms later: a
+        # Twister window handed to the next match in between would otherwise
+        # become the baseline, and the stale HUD would sit there unnoticed.
+        tablewindow.seed_title_table_no()
+        log.info(
             "HUD attach: table=%r site=%s hwnd=%s title=%r geometry=(%s,%s %sx%s)",
             temp_key,
             hud_site_name,
@@ -2769,7 +4331,7 @@ class HudMain(QObject):
         qualified = self._qualify_fast_fold_table(info, new_hand_id)
         if qualified is None:
             return None
-        info = qualified
+        info = qualified.info
         table_name = info.table_name
         table_info = info
 
@@ -2778,6 +4340,7 @@ class HudMain(QObject):
             # Remembered so the background import path keeps the live composition
             # from the very first hand, before any log update has been matched.
             self._fast_fold_tables.add(temp_key)
+            temp_key = self._resolve_fast_fold_key(temp_key, table_no=qualified.table_no)
         log.debug("Generated temp_key: %s for table: %s", temp_key, table_name)
 
         # Idempotency: skip a hand already processed for this table (duplicate
@@ -2796,6 +4359,7 @@ class HudMain(QObject):
             self._create_new_hud(new_hand_id, temp_key, table_info, site_id, num_seats, hud_site_name)
             if temp_key in self.hud_dict:
                 self._last_processed_hands[temp_key] = new_hand_id
+                self._remember_live_table(temp_key, table_name)
                 return temp_key
             return None
 
@@ -2835,6 +4399,11 @@ class HudMain(QObject):
         if temp_key not in self.hud_dict:
             return None
         self._last_processed_hands[temp_key] = new_hand_id
+        self._remember_live_table(temp_key, table_name)
+        if info.fast:
+            # Past the idempotence check and past creation: this hand really
+            # reached the screen, which is the only case worth announcing.
+            self._log_fast_fold_import_applied(new_hand_id, temp_key)
         return temp_key
 
     def _set_table_stats(self, hud: Hud.Hud, hand_id: str) -> None:
@@ -2974,8 +4543,21 @@ class HudMain(QObject):
                 label.hide()
                 label.deleteLater()
                 self.hud_dict[table].tablehudlabel = None
+                overlays = self._describe_overlay_win_ids(hud)
                 self.hud_dict[table].kill()
+                retiring_hwnd = getattr(getattr(hud, "table", None), "number", None)
                 del self.hud_dict[table]
+                self._forget_window_seat_state(table, retiring_hwnd)
+                released = self._window_registry.release(table)
+                log.debug(
+                    "HUD destroyed: session=%s pid=%s generation=%s table=%r window_id=%s overlays=%s",
+                    session_id(),
+                    os.getpid(),
+                    None if released is None else released.generation,
+                    table,
+                    None if released is None else released.window_id,
+                    overlays,
+                )
             self.main_window.resize(1, 1)
         except Exception:
             log.exception("Error killing HUD for table: %s.", table)
@@ -3113,7 +4695,11 @@ if __name__ == "__main__":
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, "HUD_trace.log")
             handler = logging.FileHandler(log_path, encoding="utf-8")
-            handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+            # The session id and pid are what let one trace file holding
+            # several relaunches be split back into them.
+            handler.setFormatter(
+                logging.Formatter(f"%(asctime)s [{session_id()}/%(process)d] - %(message)s"),
+            )
             trace_log.addHandler(handler)
             trace_log.propagate = False
             trace_log.info("HUD Trace Log Initialized")
@@ -3125,11 +4711,45 @@ if __name__ == "__main__":
             # HUD-log.txt. "hud_trace" is unregistered, so this handler survives.
             trace_log.info("HUD trace channel active (bypasses fpdb logger registry)")
 
-    (options, argv) = Options.fpdb_options()
+    identity = log_process_identity(log, ROLE_HUD)
 
-    app = QApplication([])
-    apply_stylesheet(app, theme="dark_purple.xml")
+    try:
+        hud_instance_lock = acquire_hud_instance_lock(format_identity(identity))
+    except LockUndeterminedError as exc:
+        # Not a refusal: the lock mechanism never answered. Saying "another HUD
+        # owns the lock" here would be a guess, and the one time it was wrong
+        # the user had no HUD to quit and no way to tell (#259).
+        log.error(
+            "HUD startup aborted: the single-HUD lock %s could not be tested (%s). This process "
+            "(pid=%s session=%s) is exiting. Whether another HUD is running is unknown.",
+            HUD_INSTANCE_LOCK_NAME,
+            exc,
+            identity["pid"],
+            identity["session"],
+        )
+        raise SystemExit(HUD_LOCK_UNDETERMINED_EXIT_CODE) from None
+    except SingleInstanceError:
+        # Naming the owner matters: two HUDs draw two sets of stat blocks over
+        # every table, and without this the second one dies silently and the
+        # player is left looking at a duplicate nobody can account for.
+        log.error(
+            "HUD startup refused: another FPDB HUD already owns %s. This process (pid=%s session=%s) "
+            "is exiting. Owner: %s",
+            HUD_INSTANCE_LOCK_NAME,
+            identity["pid"],
+            identity["session"],
+            read_lock_owner() or "not recorded (an older build, or a lock with no file)",
+        )
+        raise SystemExit(HUD_ALREADY_RUNNING_EXIT_CODE) from None
 
-    hm = HudMain(options, db_name=options.dbname)
+    try:
+        (options, argv) = Options.fpdb_options()
 
-    app.exec()
+        app = QApplication([])
+        apply_stylesheet(app, theme="dark_purple.xml")
+
+        hm = HudMain(options, db_name=options.dbname)
+
+        app.exec()
+    finally:
+        hud_instance_lock.release()

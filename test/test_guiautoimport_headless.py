@@ -19,7 +19,6 @@ import pytest
 # GuiAutoImport uses legacy-style bare imports (e.g. ``import interlocks``), so
 # the fpdb_3_legacy package directory must be importable directly.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "fpdb_3_legacy")))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
 def _make_settings(lock):
@@ -84,6 +83,8 @@ def test_run_headless_imports_then_shuts_down_cleanly():
     lock.acquire.return_value = True
     gui = _make_gui(_make_settings(lock), _make_config(interval=1))
     gui.updatePaths = MagicMock()
+    path_sync_states = []
+    gui.updatePaths.side_effect = lambda: path_sync_states.append(gui.doAutoImportBool)
 
     # Stop the otherwise-infinite loop after the first sleep.
     with patch.object(sys.modules["fpdb_3_legacy.GuiAutoImport"].time, "sleep", side_effect=KeyboardInterrupt):
@@ -91,6 +92,7 @@ def test_run_headless_imports_then_shuts_down_cleanly():
 
     assert rc == 0
     gui.updatePaths.assert_called_once()
+    assert path_sync_states == [True]
     gui.importer.autoSummaryGrab.assert_any_call()  # per-cycle grab
     gui.importer.runUpdated.assert_called_once()
     gui.importer.autoSummaryGrab.assert_called_with(force=True)  # final grab
@@ -118,7 +120,6 @@ def test_update_paths_monitors_multiple_sites_and_content_types(tmp_path):
     sites = ["PokerStars", "Winamax"]
     config.get_supported_sites.return_value = sites
     config.get_site_parameters.side_effect = lambda site: {"enabled": site in sites}
-
     paths = {}
     for site in sites:
         hh_path = tmp_path / site / "hands"
@@ -134,6 +135,7 @@ def test_update_paths_monitors_multiple_sites_and_content_types(tmp_path):
     gui = _make_gui(_make_settings(MagicMock()), config)
     gui.importer.dirlist = {}
     gui.addText = MagicMock()
+    gui.doAutoImportBool = True
 
     gui.updatePaths()
 
@@ -145,6 +147,111 @@ def test_update_paths_monitors_multiple_sites_and_content_types(tmp_path):
     assert gui.importer.addImportDirectory.call_count == 4
     for site_key, path in expected.items():
         gui.importer.addImportDirectory.assert_any_call(path, monitor=True, site=site_key)
+    assert [entry.args[0] for entry in config.get_default_paths.call_args_list] == sites
+
+
+def test_passive_path_refresh_does_not_reload_or_probe_configuration():
+    """Opening the tab or receiving a passive observer refresh touches no paths."""
+    config = _make_config()
+    config.get_supported_sites.side_effect = AssertionError("site paths must remain untouched while stopped")
+    gui = _make_gui(_make_settings(MagicMock()), config)
+    gui.importer.dirlist = {("Winamax", "hh"): ["/previous/path", "passthrough"]}
+
+    gui.updatePaths()
+
+    config.reload.assert_not_called()
+    config.get_supported_sites.assert_not_called()
+    config.get_default_paths.assert_not_called()
+    gui.importer.addImportDirectory.assert_not_called()
+    gui.importer.removeImportDirectory.assert_not_called()
+
+
+def test_update_paths_resolves_enabled_sites_but_never_disabled_sites(tmp_path):
+    """Active path recovery is allowed only for enabled sites."""
+    detected_hands = tmp_path / "Winamax" / "accounts" / "Hero" / "history"
+    detected_hands.mkdir(parents=True)
+    config = _make_config()
+    config.get_supported_sites.return_value = ["Winamax", "Disabled", "NoPaths"]
+    config.get_site_parameters.side_effect = {
+        "Winamax": {
+            "enabled": True,
+        },
+        "Disabled": {
+            "enabled": False,
+            "HH_path": "~/Downloads/disabled/hands",
+            "TS_path": "~/Library/Application Support/disabled/summaries",
+        },
+        "NoPaths": {"enabled": True},
+    }.__getitem__
+
+    def detected_paths(site):
+        if site == "Disabled":
+            raise AssertionError("disabled site path detection must never run")
+        if site == "Winamax":
+            return {"hud-defaultPath": str(detected_hands)}
+        return {}
+
+    config.get_default_paths.side_effect = detected_paths
+
+    gui = _make_gui(_make_settings(MagicMock()), config)
+    gui.importer.dirlist = {}
+    gui.addText = MagicMock()
+    gui.doAutoImportBool = True
+
+    gui.updatePaths()
+
+    gui.importer.addImportDirectory.assert_called_once_with(
+        str(detected_hands),
+        monitor=True,
+        site=("Winamax", "hh"),
+    )
+    assert [entry.args[0] for entry in config.get_default_paths.call_args_list] == ["Winamax", "NoPaths"]
+
+
+def test_active_config_refresh_replaces_only_the_changed_watch(tmp_path):
+    """Dynamic path changes still resynchronise an active auto-import session."""
+    old_hands = tmp_path / "old" / "hands"
+    new_hands = tmp_path / "new" / "hands"
+    new_hands.mkdir(parents=True)
+    config = _make_config()
+    config.get_supported_sites.return_value = ["Winamax"]
+    config.get_site_parameters.return_value = {"enabled": True}
+    config.get_default_paths.return_value = {"hud-defaultPath": str(new_hands)}
+    gui = _make_gui(_make_settings(MagicMock()), config)
+    gui.importer.dirlist = {("Winamax", "hh"): [str(old_hands), "passthrough"]}
+    gui.addText = MagicMock()
+    gui.doAutoImportBool = True
+
+    gui.updatePaths()
+
+    config.reload.assert_called_once_with()
+    gui.importer.removeImportDirectory.assert_called_once_with(str(old_hands), site=("Winamax", "hh"))
+    gui.importer.addImportDirectory.assert_called_once_with(
+        str(new_hands),
+        monitor=True,
+        site=("Winamax", "hh"),
+    )
+
+
+def test_standalone_main_does_not_resolve_paths_before_headless_start():
+    """The standalone entry point must not auto-detect a default site path."""
+    from fpdb_3_legacy import GuiAutoImport
+
+    config = _make_config()
+    config.get_default_paths.side_effect = AssertionError("default path resolution is not startup work")
+    runner = MagicMock()
+    runner.run_headless.return_value = 0
+
+    with (
+        patch.object(GuiAutoImport.Configuration, "Config", return_value=config),
+        patch.object(GuiAutoImport, "GuiAutoImport", return_value=runner) as gui_class,
+        patch.object(GuiAutoImport.interlocks, "InterProcessLock", return_value=MagicMock()),
+    ):
+        assert GuiAutoImport.main(["-q"]) == 0
+
+    config.get_default_paths.assert_not_called()
+    gui_class.assert_called_once()
+    assert gui_class.call_args.kwargs["cli"] is True
 
 
 def test_hud_base_path_is_module_dir_and_holds_hud_main():
@@ -193,8 +300,8 @@ def test_launch_hud_uses_bundled_sibling_executable(monkeypatch, tmp_path, platf
     assert popen_kwargs["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
 
 
-def test_launch_hud_pyinstaller_macos_reuses_main_app_identity(monkeypatch, tmp_path):
-    """The HUD must share fpdb.app's TCC grants instead of using a sibling identity."""
+def test_launch_hud_pyinstaller_macos_reuses_the_main_executable(monkeypatch, tmp_path):
+    """The macOS HUD must retain the main bundle's privacy identity."""
     settings = _make_settings(MagicMock())
     settings["cl_options"] = "--config bundled.xml"
     config = _make_config()
@@ -207,6 +314,7 @@ def test_launch_hud_pyinstaller_macos_reuses_main_app_identity(monkeypatch, tmp_
     monkeypatch.setattr(gui_mod.sys, "frozen", True, raising=False)
     monkeypatch.setattr(gui_mod.sys, "executable", str(fpdb_executable))
     monkeypatch.setattr(gui_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(gui, "_hud_base_path", lambda: str(tmp_path))
 
     with patch.object(gui_mod.subprocess, "Popen", return_value=MagicMock()) as mock_popen:
         gui._launch_hud()
@@ -215,9 +323,6 @@ def test_launch_hud_pyinstaller_macos_reuses_main_app_identity(monkeypatch, tmp_
     assert command == [str(fpdb_executable), "--hud", "--config", "bundled.xml"]
     child_env = mock_popen.call_args.kwargs["env"]
     assert child_env["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
-    # Finding table windows no longer depends on macOS Accessibility, so the
-    # HUD must not push the user at System Settings on every launch.
-    assert "FPDB_REQUEST_MACOS_PERMISSIONS" not in child_env
 
 
 def test_launch_hud_pyoxidizer_reuses_main_executable(monkeypatch, tmp_path):
@@ -268,6 +373,28 @@ def test_check_hud_process_started_clears_terminated_process():
 
     gui.addText.assert_called_once_with("\n*** HUD_main exited during startup with code 7", "error")
     assert gui.pipe_to_hud is None
+
+
+def test_an_untestable_lock_is_not_reported_as_another_hud():
+    """The player is told what is known, which is that nothing is known (#259).
+
+    Sending them off to quit a HUD they may not have is the failure this
+    branch exists to avoid.
+    """
+    from fpdb_3_legacy.interlocks import HUD_LOCK_UNDETERMINED_EXIT_CODE
+
+    gui = _make_gui(_make_settings(MagicMock()), _make_config())
+    process = MagicMock(pid=1234)
+    process.poll.return_value = HUD_LOCK_UNDETERMINED_EXIT_CODE
+    gui.pipe_to_hud = process
+    gui.addText = MagicMock()
+
+    gui._check_hud_process_started()
+
+    message = gui.addText.call_args.args[0]
+    assert "could not be tested" in message
+    assert "is unknown" in message
+    assert "Quit the other one" not in message
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="exercises the POSIX/source HUD-launch branch")

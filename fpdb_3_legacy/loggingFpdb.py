@@ -1164,6 +1164,19 @@ class FpdbLogFormatter(colorlog.ColoredFormatter):
         return re.sub(pattern, repl, message)
 
 
+def _log_session_id() -> str:
+    """Return this launch's session id without importing at module scope.
+
+    Deferred because logging is set up before most of the package is
+    importable, and a formatter must never be the reason a launch fails.
+    """
+    try:
+        from fpdb_3_legacy.hud_diagnostics import session_id
+    except Exception:  # pragma: no cover - logging must survive any import error
+        return "unknown"
+    return session_id()
+
+
 class JsonFormatter(logging.Formatter):
     """Formatter that converts log records to JSON format.
 
@@ -1175,11 +1188,18 @@ class JsonFormatter(logging.Formatter):
 
         The included fields are:
             - asctime : Timestamp of the log event.
+            - session : Id shared by every process of one launch.
+            - pid : Process that emitted the line.
             - name : Name of the logger.
             - levelname : Severity level (DEBUG, INFO, etc.).
             - module : Name of the module where the log was generated.
             - funcName : Name of the function where the log was generated.
             - message : The log message itself.
+
+        ``session`` and ``pid`` exist so one file holding several launches can
+        be split back into them. Without it, a HUD child's lines and those of
+        the run before it are indistinguishable, which is what made the
+        duplicate-overlay reports impossible to settle.
 
         Args:
             record (LogRecord): The log record to format.
@@ -1190,6 +1210,8 @@ class JsonFormatter(logging.Formatter):
         """
         record_dict = {
             "asctime": self.formatTime(record, self.datefmt),  # Format the timestamp
+            "session": _log_session_id(),  # Launch this line belongs to
+            "pid": record.process,  # Emitting process
             "name": record.name,  # Logger name
             "levelname": record.levelname,  # Log level
             "module": record.module,  # Originating module
@@ -1611,6 +1633,26 @@ class FpdbLogger:
         stacklevel = self._get_stacklevel()
         self.logger.exception(msg, *args, stacklevel=stacklevel, **kwargs)
 
+    def log(self, level: int, msg: object, *args: Any, **kwargs: Any) -> None:
+        """Log at a level decided at runtime.
+
+        The wrapper mirrors logging.Logger's per-level methods, and callers that
+        pick their level from what they measured need the variable-level form
+        too -- a diagnostic that is a WARNING when it reports a problem and a
+        DEBUG when it reports that there is none. Without this, such a caller
+        raised AttributeError against the real logger while passing every test
+        that handed it a standard logging.Logger.
+
+        Args:
+            level (int): The level to log at (e.g. logging.WARNING).
+            msg (str): The log message.
+            *args: Positional arguments for message formatting.
+            **kwargs: Keyword arguments for message formatting.
+
+        """
+        stacklevel = self._get_stacklevel()
+        self.logger.log(level, msg, *args, stacklevel=stacklevel, **kwargs)
+
     def setLevel(self, level: int) -> None:
         """Set the logging level for this logger.
 
@@ -1648,6 +1690,7 @@ class FpdbLogger:
                 "info",
                 "warning",
                 "error",
+                "log",
                 "__init__",
                 "_get_stacklevel",
             ):
