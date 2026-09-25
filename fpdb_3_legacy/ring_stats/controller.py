@@ -8,6 +8,9 @@ des statistiques pour le tableau de bord, les positions et les cartes.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import sys
 from typing import Any
 
 from PySide6.QtCore import QObject, Qt, Signal
@@ -25,6 +28,25 @@ def debug_log(msg: str) -> None:
     """Route detailed diagnostics through the configured logger."""
     log.debug(msg)
 
+
+def running_under_test() -> bool:
+    """True while a test runner is driving this process.
+
+    ``"unittest" in sys.modules`` used to be half of this test, and it was
+    wrong in production in the worst possible way. ``fpdb_3_legacy.interlocks``
+    imported ``doctest`` at module scope, ``doctest`` imports ``unittest``, and
+    ``fpdb.pyw`` imports ``interlocks`` while starting up -- so every real run
+    of the GUI looked like a test run. Ring Player Stats therefore ran all four
+    of its queries and built every model on the GUI thread, which is exactly
+    what the DbWorker threads exist to avoid, and the asynchronous path only
+    ever ran where nobody was looking.
+
+    Nothing in the application imports pytest, and ``PYTEST_CURRENT_TEST`` is
+    set by pytest for the duration of a test, so both signals mean what they
+    say.
+    """
+    return "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
+
 colalias, colheading, colshowsumm, colshowposn, colformat, coltype, colxalign = (
     0, 1, 2, 3, 4, 5, 6
 )
@@ -39,7 +61,7 @@ fast_names = {
     "Winamax": "Go Fast"
 }
 _WINNINGS_ALIASES = frozenset({"net", "bbper100", "profitperhand", "evbb100", "bb100", "profit100"})
-_MAX_DETAIL_ROWS = 1000
+_MAX_DETAIL_ROWS = 500
 
 # Textes d'aide pour les infobulles des colonnes
 onlinehelp = {
@@ -104,7 +126,7 @@ class RingStatsController(QObject):
     # Carries a NoDataReason value so the view can explain *why* it is empty.
     no_data_found = Signal(str)
 
-    def __init__(self, db, config, sql) -> None:
+    def __init__(self, db, config, sql, *, async_mode: bool | None = None) -> None:
         super().__init__()
         self.db = db
         self.cursor = db.cursor
@@ -113,18 +135,66 @@ class RingStatsController(QObject):
         self.columns = config.get_gui_cash_stat_params()
         self._workers: list[DbWorker] = []
 
-        # Détection automatique de l'environnement de test ou SQLite pour exécution synchrone
-        # En mode SQLite, nous forçons l'exécution synchrone pour éviter les exceptions de thread
-        import sys
-        is_sqlite = (hasattr(db, "backend") and db.backend == 4)
-        self.async_mode = (not is_sqlite) and ("pytest" not in sys.modules and "unittest" not in sys.modules)
+        # Synchronous only under a test runner, so a test can assert on results
+        # without pumping the event loop. Passing async_mode explicitly wins.
+        self.async_mode = not running_under_test() if async_mode is None else async_mode
 
         self._last_summary_stats: dict[str, Any] | None = None
-        self._last_profit_data: tuple[Any, Any, Any, Any] | None = None
+        self._last_profit_data: tuple[Any, Any, Any, Any, Any] | None = None
+
+        # Bumped by every refresh_all. A result carrying an older number belongs
+        # to filters the user has already replaced: see is_current_result.
+        self._generation = 0
+
+    def shutdown_workers(self) -> None:
+        """Stop all DbWorker threads started by this controller.
+
+        Called when the host tab is closed or refreshed. Disconnecting the
+        signals is what actually protects the UI: a worker that finishes after
+        its tab is gone then has nobody to deliver results to.
+
+        It does not terminate the thread, for the reason ``ModernStatsWidget``
+        already documents -- ``QThread.terminate`` kills the thread wherever it
+        happens to be, including inside ``Database.worker_connection``, which
+        holds a semaphore permit from a pool of four shared by every tab. Four
+        such kills and the next query waits for a permit that will never be
+        released. The queries here are bounded, so letting one finish and be
+        ignored costs a fraction of a second.
+        """
+        for worker in self._workers:
+            if worker.isRunning():
+                with contextlib.suppress(TypeError, RuntimeError):
+                    worker.finished.disconnect()
+                with contextlib.suppress(TypeError, RuntimeError):
+                    worker.error.disconnect()
+        self._workers = []
+
+    def is_current_result(self) -> bool:
+        """False when this result belongs to a refresh the user has replaced.
+
+        Disconnecting a superseded worker's signals is not enough on its own.
+        ``shutdown_workers`` only reaches workers that are still running, and a
+        query that came back quickly is neither running nor still in the list --
+        its callback is simply sitting in the GUI thread's event queue, and it
+        is delivered after the next refresh has already started.
+
+        The visible half of that is a table filled from the previous filters.
+        The quiet half is worse: ``_check_and_emit_dashboard`` emits as soon as
+        it holds both a summary and a profit series, so a stale one arriving
+        beside a fresh one produces a single dashboard describing two different
+        filter sets, with nothing on screen to say so.
+
+        A worker carrying no generation at all is treated as current: the
+        callbacks are called directly in tests, where there is no sender to ask.
+        """
+        generation = getattr(self.sender(), "generation", None)
+        return generation is None or generation == self._generation
 
     def refresh_all(self, filter_widget) -> None:
         """Lance l'ensemble des requêtes asynchrones en fonction des filtres appliqués."""
         debug_log("refresh_all called!")
+        self.shutdown_workers()
+        self._generation += 1
         # 1. Extraction des filtres
         sites = filter_widget.getSites()
         heroes = filter_widget.getHeroes()
@@ -174,22 +244,43 @@ class RingStatsController(QObject):
         # Paramètres pour affiner les requêtes
         filter_params = (filter_widget, playerids, sitenos, limits, seats, groups, dates, games, currencies, num_hands)
 
+        import logging
+        import time
+        log = logging.getLogger("controller")
+
+        t0 = time.time()
         # 2. Lancer la requête pour le tableau résumé (summary grid)
         sql_summary = self._get_refined_sql("playerDetailedStats", False, *filter_params)
+        t1 = time.time()
+        log.warning(f"[PERF] controller sql_summary generation: {t1-t0:.3f}s")
         self._run_query("summary", sql_summary, self._on_summary_query_finished)
 
         # 3. Lancer la requête pour le détail des mains (hand detailed stats)
         if "allplayers" not in groups:
             sql_hands = self._get_refined_sql("playerDetailedStats", True, *filter_params)
+            t2 = time.time()
+            log.warning(f"[PERF] controller sql_hands generation: {t2-t1:.3f}s")
             self._run_query("hands", sql_hands, self._on_hands_query_finished)
+        else:
+            t2 = time.time()
 
         # 4. Lancer la requête spécifique pour le Poker Table (Heatmap de position)
         sql_positions = self._get_refined_sql("playerDetailedStats", False, *filter_params, force_position=True)
+        t3 = time.time()
+        log.warning(f"[PERF] controller sql_positions generation: {t3-t2:.3f}s")
         self._run_query("positions", sql_positions, self._on_positions_query_finished)
 
         # 5. Lancer la requête chronologique de profit
         sql_profit = self._get_refined_sql_profit(playerids, sitenos, limits, dates, games, currencies, filter_widget)
+        t4 = time.time()
+        log.warning(f"[PERF] controller sql_profit generation: {t4-t3:.3f}s. Total queries dispatch: {t4-t0:.3f}s")
         self._run_query("profit", sql_profit, self._on_profit_query_finished)
+
+        # The player and site lookups above ran on the tab's own connection, and
+        # a read opens a transaction like anything else. The workers use their
+        # own pooled connections, so ending this one now leaves nothing of this
+        # refresh holding a lock (#271).
+        self.db.rollback()
 
     def _run_query(self, query_name: str, sql: str, callback) -> None:
         """Lance une requête asynchrone à l'aide d'un DbWorker (ou synchrone en test)."""
@@ -198,7 +289,11 @@ class RingStatsController(QObject):
         # Nettoyer les anciens workers
         self._workers = [w for w in self._workers if not w.isFinished()]
 
-        worker = DbWorker(self.cursor, query_name, sql)
+        worker = DbWorker(self.db, query_name, sql)
+        # Read back through sender() by is_current_result. Carried on the worker
+        # rather than added to the signal so DbWorker stays the same object the
+        # other stats widgets connect to.
+        worker.generation = self._generation
         worker.finished.connect(callback)
 
         def on_error(err):
@@ -215,10 +310,14 @@ class RingStatsController(QObject):
 
     def _on_summary_query_finished(self, name: str, result: list, colnames: list) -> None:
         """Callback appelé lorsque la requête récapitulative est terminée."""
+        if not self.is_current_result():
+            debug_log("_on_summary_query_finished: result of a superseded refresh, discarded")
+            return
+
         debug_log(f"_on_summary_query_finished: returned {len(result) if result else 0} rows")
         if not result:
             self._last_summary_stats = {}
-            self._last_profit_data = ([], [], [], [])
+            self._last_profit_data = ([], [], [], [], [])
             self.no_data_found.emit(gui_empty_state.NoDataReason.NO_ROWS.value)
             return
 
@@ -243,11 +342,15 @@ class RingStatsController(QObject):
 
     def _on_profit_query_finished(self, name: str, result: list, colnames: list) -> None:
         """Callback appelé lorsque la requête chronologique de profit est terminée."""
+        if not self.is_current_result():
+            debug_log("_on_profit_query_finished: result of a superseded refresh, discarded")
+            return
+
         debug_log(f"_on_profit_query_finished: returned {len(result) if result else 0} rows")
         import numpy as np
 
         if not result:
-            self._last_profit_data = ([], [], [], [])
+            self._last_profit_data = ([], [], [], [], [])
             self._check_and_emit_dashboard()
             return
 
@@ -256,16 +359,18 @@ class RingStatsController(QObject):
             blue = np.array([0.0, *[float(x[1]) if x[2] else 0.0 for x in result]])
             red = np.array([0.0, *[float(x[1]) if not x[2] else 0.0 for x in result]])
             orange = np.array([0.0, *[float(x[3]) if x[3] is not None else 0.0 for x in result]])
+            splash = np.array([0.0, *[float(x[4]) if x[4] is not None else 0.0 for x in result]])
 
             greenline = green.cumsum() / 100.0
             blueline = blue.cumsum() / 100.0
             redline = red.cumsum() / 100.0
             orangeline = orange.cumsum() / 100.0
+            nosplashline = (green - splash).cumsum() / 100.0
 
-            self._last_profit_data = (greenline, blueline, redline, orangeline)
+            self._last_profit_data = (greenline, blueline, redline, orangeline, nosplashline)
         except Exception as e:
             log.error(f"Error processing profit data: {e}")
-            self._last_profit_data = ([], [], [], [])
+            self._last_profit_data = ([], [], [], [], [])
 
         self._check_and_emit_dashboard()
 
@@ -275,6 +380,10 @@ class RingStatsController(QObject):
 
     def _on_hands_query_finished(self, name: str, result: list, colnames: list) -> None:
         """Callback appelé lorsque la requête détaillée par main est terminée."""
+        if not self.is_current_result():
+            debug_log("_on_hands_query_finished: result of a superseded refresh, discarded")
+            return
+
         debug_log(f"_on_hands_query_finished: returned {len(result) if result else 0} rows")
         if not result:
             return
@@ -315,6 +424,10 @@ class RingStatsController(QObject):
 
     def _on_positions_query_finished(self, name: str, result: list, colnames: list) -> None:
         """Callback pour l'affichage de la table de poker positionnelle."""
+        if not self.is_current_result():
+            debug_log("_on_positions_query_finished: result of a superseded refresh, discarded")
+            return
+
         position_stats = {}
 
         vpip_idx = colnames.index("vpip") if "vpip" in colnames else -1
@@ -358,97 +471,101 @@ class RingStatsController(QObject):
         color_down = QColor(c_palette.get("graph_down", "#f56565"))
         color_neutral = QColor(c_palette.get("text", "#edf2f7"))
 
-        for sqlrow in range(len(result)):
-            treerow: list[QStandardItem] = []
-            for col, column in enumerate(cols_to_show):
-                value = None
-                sortValue = -1e9
+        model.blockSignals(True)
+        try:
+            for sqlrow in range(len(result)):
+                treerow: list[QStandardItem] = []
+                for col, column in enumerate(cols_to_show):
+                    value = None
+                    sortValue = -1e9
 
-                if column[colalias] in colnames:
-                    value = result[sqlrow][colnames.index(column[colalias])]
-                    if column[colalias] == "plposition":
-                        if value == "B":
-                            value = "BB"
-                        elif value == "S":
-                            value = "SB"
-                        elif value == "0":
-                            value = "Btn"
-                elif column[colalias] == "game":
-                    if holecards:
-                        cat_idx = colnames.index("category")
-                        value = Card.decodeStartHandValue(result[sqlrow][cat_idx], result[sqlrow][hgametypeid_idx])
-                    else:
-                        # Formatage d'une ligne de limite de jeu
-                        minbb = result[sqlrow][colnames.index("minbigblind")]
-                        maxbb = result[sqlrow][colnames.index("maxbigblind")]
-                        value = (
-                            result[sqlrow][colnames.index("limittype")] + " " +
-                            result[sqlrow][colnames.index("category")].title() + " " +
-                            result[sqlrow][colnames.index("name")] + " " +
-                            result[sqlrow][colnames.index("currency")] + " "
-                        )
-                        if 100 * int(minbb // 100.0) != minbb:
-                            value += f"{minbb // 100.0:.2f}"
+                    if column[colalias] in colnames:
+                        value = result[sqlrow][colnames.index(column[colalias])]
+                        if column[colalias] == "plposition":
+                            if value == "B":
+                                value = "BB"
+                            elif value == "S":
+                                value = "SB"
+                            elif value == "0":
+                                value = "Btn"
+                    elif column[colalias] == "game":
+                        if holecards:
+                            cat_idx = colnames.index("category")
+                            value = Card.decodeStartHandValue(result[sqlrow][cat_idx], result[sqlrow][hgametypeid_idx])
                         else:
-                            value += f"{minbb // 100.0:.0f}"
-                        if minbb != maxbb:
-                            if 100 * int(maxbb // 100.0) != maxbb:
-                                value += f" - {maxbb // 100.0:.2f}"
-                            else:
-                                value += f" - {maxbb // 100.0:.0f}"
-                        ante = result[sqlrow][colnames.index("ante")]
-                        if ante > 0:
-                            value += f" ante: {ante // 100.0:.2f}"
-                        if result[sqlrow][colnames.index("fast")] == 1:
-                            value += " " + fast_names.get(result[sqlrow][colnames.index("name")], "Fast")
-
-                # Valeur par défaut
-                item = QStandardItem("")
-                if value is not None and value != -999:
-                    item = QStandardItem(column[colformat] % value)
-
-                    # Déterminer la valeur de tri (sortValue)
-                    if column[colalias] == "game" and holecards:
-                        cat_idx = colnames.index("category")
-                        if result[sqlrow][cat_idx] == "holdem":
-                            sortValue = (
-                                1000 * ranks.get(value[0], 0) +
-                                10 * ranks.get(value[1], 0) +
-                                (1 if len(value) == 3 and value[2] == "s" else 0)
+                            # Formatage d'une ligne de limite de jeu
+                            minbb = result[sqlrow][colnames.index("minbigblind")]
+                            maxbb = result[sqlrow][colnames.index("maxbigblind")]
+                            value = (
+                                result[sqlrow][colnames.index("limittype")] + " " +
+                                result[sqlrow][colnames.index("category")].title() + " " +
+                                result[sqlrow][colnames.index("name")] + " " +
+                                result[sqlrow][colnames.index("currency")] + " "
                             )
+                            if 100 * int(minbb // 100.0) != minbb:
+                                value += f"{minbb // 100.0:.2f}"
+                            else:
+                                value += f"{minbb // 100.0:.0f}"
+                            if minbb != maxbb:
+                                if 100 * int(maxbb // 100.0) != maxbb:
+                                    value += f" - {maxbb // 100.0:.2f}"
+                                else:
+                                    value += f" - {maxbb // 100.0:.0f}"
+                            ante = result[sqlrow][colnames.index("ante")]
+                            if ante > 0:
+                                value += f" ante: {ante // 100.0:.2f}"
+                            if result[sqlrow][colnames.index("fast")] == 1:
+                                value += " " + fast_names.get(result[sqlrow][colnames.index("name")], "Fast")
+
+                    # Valeur par défaut
+                    item = QStandardItem("")
+                    if value is not None and value != -999:
+                        item = QStandardItem(column[colformat] % value)
+
+                        # Déterminer la valeur de tri (sortValue)
+                        if column[colalias] == "game" and holecards:
+                            cat_idx = colnames.index("category")
+                            if result[sqlrow][cat_idx] == "holdem":
+                                sortValue = (
+                                    1000 * ranks.get(value[0], 0) +
+                                    10 * ranks.get(value[1], 0) +
+                                    (1 if len(value) == 3 and value[2] == "s" else 0)
+                                )
+                            else:
+                                sortValue = -1
+                        elif column[colalias] in ("game", "pname"):
+                            sortValue = value
+                        elif column[colalias] == "plposition":
+                            order_list = ["BB", "SB", "Btn", "1", "2", "3", "4", "5", "6", "7"]
+                            sortValue = order_list.index(value) if value in order_list else 99
                         else:
-                            sortValue = -1
-                    elif column[colalias] in ("game", "pname"):
-                        sortValue = value
-                    elif column[colalias] == "plposition":
-                        order_list = ["BB", "SB", "Btn", "1", "2", "3", "4", "5", "6", "7"]
-                        sortValue = order_list.index(value) if value in order_list else 99
-                    else:
-                        sortValue = float(value)
+                            sortValue = float(value)
 
-                item.setData(sortValue, Qt.ItemDataRole.UserRole)
-                item.setEditable(False)
+                    item.setData(sortValue, Qt.ItemDataRole.UserRole)
+                    item.setEditable(False)
 
-                # Appliquer la couleur vert/rouge sur les profits
-                if column[colalias] in _WINNINGS_ALIASES and value is not None and value != -999:
-                    try:
-                        v = float(value)
-                        item.setForeground(QBrush(color_up if v > 0 else color_down if v < 0 else color_neutral))
-                    except (TypeError, ValueError):
-                        pass
+                    # Appliquer la couleur vert/rouge sur les profits
+                    if column[colalias] in _WINNINGS_ALIASES and value is not None and value != -999:
+                        try:
+                            v = float(value)
+                            item.setForeground(QBrush(color_up if v > 0 else color_down if v < 0 else color_neutral))
+                        except (TypeError, ValueError):
+                            pass
 
-                # Alignements des cellules (à droite sauf pour la colonne 0)
-                if col != 0:
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    # Alignements des cellules (à droite sauf pour la colonne 0)
+                    if col != 0:
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-                # Tooltip d'aide en survol
-                if column[colalias] != "game" and len(treerow) > 0:
-                    desc_heading = column[colheading]
-                    help_text = onlinehelp.get(desc_heading, desc_heading)
-                    item.setToolTip(f"<big>{desc_heading} pour {treerow[0].text()}</big><br/><i>{help_text}</i>")
+                    # Tooltip d'aide en survol
+                    if column[colalias] != "game" and len(treerow) > 0:
+                        desc_heading = column[colheading]
+                        help_text = onlinehelp.get(desc_heading, desc_heading)
+                        item.setToolTip(f"<big>{desc_heading} pour {treerow[0].text()}</big><br/><i>{help_text}</i>")
 
-                treerow.append(item)
-            model.appendRow(treerow)
+                    treerow.append(item)
+                model.appendRow(treerow)
+        finally:
+            model.blockSignals(False)
 
     def _calculate_dashboard_kpis(self, result: list, colnames: list) -> dict:
         """Calcule les KPIs totaux du joueur en agrégeant les lignes de résultats."""

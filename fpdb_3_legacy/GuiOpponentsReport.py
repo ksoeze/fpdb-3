@@ -46,6 +46,7 @@ limits in the filter sidebar to speed it up.
 # In the "official" distribution you can find the license in agpl-3.0.txt.
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Sequence
 from time import time
 
@@ -68,6 +69,7 @@ from fpdb_3_legacy import Database, Filters, LeakDetector, gui_empty_state
 from fpdb_3_legacy.i18n import gettext as _
 from fpdb_3_legacy.localized_formats import format_number
 from fpdb_3_legacy.loggingFpdb import get_logger
+from fpdb_3_legacy.table_export import install_table_export
 
 log = get_logger("gui_opponents_report")
 
@@ -475,6 +477,7 @@ class GuiOpponentsReport(QSplitter):
         self.model = QStandardItemModel(0, 9, self.view)
         self.model.setSortRole(Qt.ItemDataRole.UserRole)
         self.view.setModel(self.model)
+        install_table_export(self.view)
         self.stats_frame.layout().addWidget(self.view)
 
         self.addWidget(scroll)
@@ -485,6 +488,11 @@ class GuiOpponentsReport(QSplitter):
     # ------------------------------------------------------------------
     # Data loading
     # ------------------------------------------------------------------
+    def close_owned_database(self) -> None:
+        """Release the connection created for this tab."""
+        with contextlib.suppress(Exception):
+            self.db.disconnect()
+
     def refreshStats(self, checkState=None) -> None:
         try:
             self.fillStatsFrame()

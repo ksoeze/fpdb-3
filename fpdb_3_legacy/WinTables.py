@@ -35,6 +35,27 @@ if sys.platform == "win32":
     SM_CYCAPTION = 4
 
 
+def _normalized(text: str) -> str:
+    """Case- and whitespace-insensitive form, for comparing a name to a title.
+
+    The client draws non-breaking spaces where a hand history writes ordinary
+    ones, so a literal comparison can miss a table that is plainly there --
+    which would cost that table its HUD entirely.
+    """
+    return " ".join(str(text).replace("\xa0", " ").split()).casefold()
+
+
+def _names_table(title: str, name: str) -> bool:
+    """Whether ``title`` carries ``name`` as a whole name rather than a substring.
+
+    Both arguments are already normalized. The boundaries matter because a pool
+    numbers its tables: "Colorado 1" is a substring of "Winamax Colorado 10",
+    and since the first accepted window wins, enumeration order alone would
+    decide which of the two a HUD attached to.
+    """
+    return re.search(rf"(?<!\w){re.escape(name)}(?!\w)", title) is not None
+
+
 def _window_pid(hwnd: int | None) -> int | None:
     """Return the process id owning ``hwnd`` on Windows, or None."""
     if sys.platform != "win32" or not hwnd:
@@ -65,8 +86,13 @@ class Table(Table_Window):
     Now uses the Platform Abstraction Layer (Feature 1.5) for table detection.
     """
 
+    _resolved_window = None
+
     def __init__(self, *args, **kwargs):
         """Initialize table with platform detector."""
+        # Fast Fold resolves the indexed table window at hand-start. Reusing
+        # that answer avoids a second, potentially different window scan during HUD construction.
+        self._resolved_window = kwargs.pop("resolved_window", None)
         self._detector = get_table_detector()
         self._table_geometry = None
         self.gdkhandle: QWindow | None = None
@@ -89,6 +115,40 @@ class Table(Table_Window):
         # Winamax zero-pads the table number in the title (e.g. "(#03)"), so allow
         # optional leading zeros when matching table "3" against "#03".
         return bool(re.search(rf"(?:#|Table\s*)0*{re.escape(table)}\b", title, re.IGNORECASE))
+
+    def _plain_table_name(self) -> str:
+        """This table's own name, without the window suffix fpdb appends to it.
+
+        Fast-Fold tables are keyed "Colorado 2 #198788" so that several windows
+        of one pool stay apart, but the client's title only ever carries the
+        pool name.
+        """
+        name = str(getattr(self, "name", "") or "")
+        return re.sub(r"\s*#\d+\s*$", "", name).strip()
+
+    def _matches_winamax_table(self, title: str) -> bool:
+        """Whether a Winamax window is this table's, rather than another window of the client.
+
+        The search is broadened to the bare client name (see
+        ``_detection_search_string``), so on its own it qualifies *every* Winamax
+        window -- including the lobby, whose title is exactly "Winamax" and which
+        carries none of the bad words. When the hero's tables closed and a hand
+        of one of them was imported a moment later, that is the window the HUD
+        attached to:
+
+            HUD attach: table='Colorado 1' hwnd=264154 title='Winamax' geometry=(80,98 1095x703)
+
+        The blocks were then laid out across the lobby, scaled to it, and stayed
+        there for as long as it was open.
+        """
+        if getattr(self, "type", None) == "tour":
+            return self._matches_winamax_tournament(title)
+        name = self._plain_table_name()
+        if not name:
+            # Nothing to check against. Keep the permissive behaviour rather
+            # than refuse a window we cannot prove is the wrong one.
+            return True
+        return _names_table(_normalized(title), _normalized(name))
 
     def _detection_search_string(self) -> str:
         """Broaden the title search for clients whose title omits the table id.
@@ -188,7 +248,7 @@ class Table(Table_Window):
                 if self.check_bad_words(title):
                     log.debug("Window rejected due to bad words: %s", title)
                     continue
-                if search_str == "Winamax" and not self._matches_winamax_tournament(title):
+                if search_str == "Winamax" and not self._matches_winamax_table(title):
                     log.debug("Winamax window rejected for current tournament/table: %s", title)
                     continue
                 return table_info
@@ -202,6 +262,24 @@ class Table(Table_Window):
         Now uses the platform abstraction layer for cleaner, testable code.
         """
         log.debug("Starting window detection for search string: %s", self.search_string)
+
+        if self._resolved_window is not None:
+            try:
+                number = int(self._resolved_window.window_id)
+                title = str(self._resolved_window.title)
+            except (AttributeError, TypeError, ValueError):
+                log.warning("Ignoring invalid pre-resolved Windows window: %r", self._resolved_window)
+            else:
+                if number > 0 and title and not self.check_bad_words(title):
+                    self.number = number
+                    self.title = title
+                    self._table_geometry = self._detector.get_window_geometry(number)
+                    log.debug(
+                        "Reusing pre-resolved table window HWND: %s, title: '%s'",
+                        self.number,
+                        self.title,
+                    )
+                    return
 
         search_str = self._detection_search_string()
         tables = self._detector.find_tables(search_str)
@@ -370,11 +448,27 @@ class Table(Table_Window):
             log.info("No window to move")
 
     def topify(self, window) -> None:
-        """Make the specified Qt window 'always on top' under Windows."""
+        """Make the specified Qt window 'always on top' under Windows.
+
+        Both handles are checked because the HUD calls this precisely while
+        tables are appearing and disappearing: ``fromWinId`` returns None for a
+        table that has just closed, and ``windowHandle`` returns None until the
+        HUD widget has a native window. Either one used to be dereferenced
+        unconditionally on the next line.
+        """
         if self.gdkhandle is None:
             self.gdkhandle = QWindow.fromWinId(int(self.number))
+            if self.gdkhandle is None:
+                # Not cached: a later call retries, in case the id was simply
+                # not resolvable yet.
+                log.warning("Cannot topify: no window for table id %s", self.number)
+                return
 
         qwindow = window.windowHandle()
+        if qwindow is None:
+            log.warning("Cannot topify: the HUD window has no native handle yet")
+            return
+
         qwindow.setTransientParent(self.gdkhandle)
         qwindow.setFlags(
             Qt.WindowType.Tool

@@ -35,7 +35,43 @@ def make_dist():
 def has_prefix(value, prefix):
     return value[:len(prefix)] == prefix
 
+def has_suffix(value, suffix):
+    return len(value) >= len(suffix) and value[len(value) - len(suffix):] == suffix
+
+def is_wheel_library_payload(path):
+    """Whether a plain file is a wheel's bundled shared-library directory.
+
+    delvewheel (Windows) and auditwheel (Linux) move a wheel's shared libraries
+    into a top-level "<package>.libs" directory beside the package. It is not a
+    Python package, so classification recognises nothing in it and drops the
+    whole thing -- and numpy's extension modules then cannot find
+    libscipy_openblas at import time:
+
+        ImportError: DLL load failed while importing _multiarray_umath
+
+    which is the application failing to start at all, since pandas imports
+    numpy. Only these directories are taken from the file scanner; anything
+    else it emits is already handled as a classified resource, and keeping both
+    would put a second copy of the whole payload in the bundle.
+    """
+    parts = path.replace("\\", "/").split("/")
+    # Any component, not just the first: the scanner may report a path rooted
+    # at the directory pip installed into rather than at site-packages. The
+    # name must be longer than the suffix, which keeps the hidden ".libs"
+    # directory older wheels put *inside* a package out of this -- that one is
+    # a package resource and is already classified, and taking it here as well
+    # would add a second copy of it.
+    for index in range(len(parts) - 1):
+        part = parts[index]
+        if len(part) > len(".libs") and has_suffix(part, ".libs"):
+            return True
+        if len(part) > len(".dylibs") and has_suffix(part, ".dylibs"):
+            return True
+    return False
+
 def keep_pip_resource(resource):
+    if type(resource) == "File":
+        return is_wheel_library_payload(resource.path)
     name = resource.name
     if has_prefix(name, "PySide6.scripts."):
         return False
@@ -50,7 +86,13 @@ def make_exe(dist):
     policy.set_resource_handling_mode("classify")
     policy.resources_location = "filesystem-relative:lib"
     policy.resources_location_fallback = None
-    
+    # Classification alone cannot see a wheel's bundled shared libraries, which
+    # live in a top-level "<package>.libs" directory rather than inside the
+    # package. Let the scanner emit plain files as well, and take only those
+    # directories from it (see keep_pip_resource / is_wheel_library_payload).
+    policy.allow_files = True
+    policy.file_scanner_emit_files = True
+
     config = dist.make_python_interpreter_config()
     config.filesystem_importer = True
     config.oxidized_importer = False
@@ -70,6 +112,10 @@ def make_exe(dist):
         "import runpy",
         "import sys",
         "sys.frozen = 'pyoxidizer'",
+        # A signed .app must stay byte-for-byte immutable after launch. The
+        # embedded interpreter does not reliably honour PYTHONDONTWRITEBYTECODE,
+        # so enforce this before any filesystem module is imported.
+        "sys.dont_write_bytecode = True",
         "root = os.path.dirname(sys.executable)",
         "bundle_resources = os.path.join(os.path.dirname(root), 'Resources')",
         "if os.path.isdir(os.path.join(bundle_resources, 'fpdb_3_legacy')):",
@@ -77,6 +123,17 @@ def make_exe(dist):
         "legacy_dir = os.path.join(root, 'fpdb_3_legacy')",
         "sys.path.insert(0, root)",
         "sys.path.insert(0, legacy_dir)",
+        # The packaged libraries come first, and on Windows that is not a
+        # preference: ".pyw" is an importable source suffix there, so with the
+        # legacy directory ahead of them "import fpdb" resolves to
+        # fpdb_3_legacy/fpdb.pyw -- the GUI script -- instead of the fpdb
+        # package. WinTables then dies on "No module named
+        # 'fpdb.infrastructure'; 'fpdb' is not a package", which is the HUD
+        # failing to start when auto-import launches it, and importing that
+        # script for its trouble runs the GUI's module-level code.
+        "lib_dir = os.path.join(root, 'lib')",
+        "if os.path.isdir(lib_dir):",
+        "    sys.path.insert(0, lib_dir)",
         "os.chdir(root)",
         "if len(sys.argv) > 1 and sys.argv[1] == '--hud':",
         "    sys.argv.pop(1)",
@@ -122,10 +179,14 @@ def make_exe(dist):
             if keep_pip_resource(resource):
                 pip_resources.append(resource)
     exe.add_python_resources(pip_resources)
-    exe.add_python_resources(exe.read_package_root(
-        path=CWD,
-        packages=["fpdb_3_legacy", "fpdb"],
-    ))
+    # Same filter: the scanner now emits plain files, and the source tree's own
+    # non-Python files are already installed by make_install below. Adding them
+    # here as well would put two copies of each in the bundle.
+    exe.add_python_resources([
+        resource
+        for resource in exe.read_package_root(path=CWD, packages=["fpdb_3_legacy", "fpdb"])
+        if keep_pip_resource(resource)
+    ])
     
     # Add external files/assets
     # Note: assets like gfx, locale, fonts might need to be copied relative to the executable at runtime
@@ -145,6 +206,10 @@ def make_install(exe):
             CWD + "/fpdb_3_legacy/**/*.toml",
             CWD + "/fpdb_3_legacy/**/*.xml",
             CWD + "/fpdb_3_legacy/**/*.sql",
+            # The bundled stat and filter definitions (#306) live in
+            # fpdb_3_legacy/analytics_definitions.d/*.json: without them the
+            # registry is empty and every shipped stat disappears.
+            CWD + "/fpdb_3_legacy/**/*.json",
             CWD + "/fpdb_3_legacy/**/*.md",
             CWD + "/fpdb_3_legacy/**/*.sh",
             CWD + "/gfx/**/*.png",

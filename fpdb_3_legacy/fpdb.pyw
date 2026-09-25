@@ -24,11 +24,13 @@ import sys
 if not hasattr(datetime, "UTC"):
     datetime.UTC = datetime.timezone.utc
 
-from fpdb_3_legacy.subprocess_launch import dispatch_run_module
+from fpdb_3_legacy.subprocess_launch import dispatch_hud_main, dispatch_run_module
 
 # Frozen builds have no "python -m": helper processes re-invoke this executable
 # with --run-module. Dispatch before pulling in the GUI stack below.
 if __name__ == "__main__" and dispatch_run_module():
+    sys.exit(0)
+if __name__ == "__main__" and dispatch_hud_main():
     sys.exit(0)
 
 import atexit
@@ -41,6 +43,7 @@ import os
 import pstats
 import queue
 import sqlite3
+import time
 from functools import partial
 from importlib import import_module
 from typing import Any
@@ -99,6 +102,7 @@ from fpdb_3_legacy.Exceptions import FpdbError
 from fpdb_3_legacy.GuiConfigObserver import GuiConfigObserver
 from fpdb_3_legacy.i18n import gettext as _
 from fpdb_3_legacy.L10n import set_locale_translation
+from fpdb_3_legacy.ui_instrumentation import TabOpenProfiler, perf_level
 
 np = import_module("numpy")
 
@@ -211,20 +215,108 @@ class fpdb(QMainWindow):
     #         pathcomp = f"{path}/ppt/p2.jar"
     #     subprocess.call(["java", "-jar", pathcomp])
 
-    def add_and_display_tab(self, new_page, new_tab_name) -> None:
-        """Adds a tab, namely creates the button and displays it and appends all the relevant arrays."""
+    def add_and_display_tab(self, new_page, new_tab_name, allow_multiple: bool = True) -> None:
+        """Adds a tab, creates the button, displays it and appends all the relevant arrays."""
+        t0 = time.perf_counter()
         if not new_tab_name or not isinstance(new_tab_name, str):
             raise ValueError(f"Invalid tab name: {new_tab_name!r}")
 
-        for name in self.nb_tab_names:
-            if name == new_tab_name:
-                self.display_tab(new_tab_name)
-                return  # if tab already exists, just go to it
+        if not allow_multiple and new_tab_name in self.nb_tab_names:
+            self.display_tab(new_tab_name)
+            # WARNING only when it was slow, like the other [PERF] diagnostics.
+            # The root logger is pinned to WARNING
+            # (loggingFpdb.DIAGNOSTIC_LEVEL_CAP), so a line logged at INFO never
+            # reached a single user log -- but logging every switch there, and a
+            # switch is usually under a millisecond, buried the warnings a reader
+            # is looking for instead.
+            switch_ms = (time.perf_counter() - t0) * 1000
+            log.log(
+                perf_level(switch_ms),
+                "[PERF] switched to existing tab '%s' in %.0f ms",
+                new_tab_name,
+                switch_ms,
+            )
+            if new_page is not None:
+                with contextlib.suppress(ValueError):
+                    self.threads.remove(new_page)
+                shutdown = getattr(new_page, "shutdown_workers", None)
+                if callable(shutdown):
+                    shutdown()
+                new_page.deleteLater()
+            return
 
-        self.nb_tab_names.append(new_tab_name)
+        final_tab_name = new_tab_name
+        if allow_multiple and new_tab_name in self.nb_tab_names:
+            count = 2
+            while f"{new_tab_name} ({count})" in self.nb_tab_names:
+                count += 1
+            final_tab_name = f"{new_tab_name} ({count})"
 
-        index = self.nb.addTab(new_page, new_tab_name)
+        self.nb_tab_names.append(final_tab_name)
+        if new_page not in self.threads:
+            self.threads.append(new_page)
+
+        index = self.nb.addTab(new_page, final_tab_name)
         self.nb.setCurrentIndex(index)
+        # No timing line here: it duplicated the profiler's "add_tab" phase and
+        # was logged at INFO, below the log file's floor.
+
+    def open_tab(self, name, build, *, allow_multiple: bool = True, module: str | None = None):
+        """Build a page, show it as a tab, and time the whole thing.
+
+        Every tab goes through here so that all of them are measured, not the
+        three that happened to carry a hand-written profiler block.
+
+        ``module`` is the module a lazily imported page comes from. It is
+        imported here, inside its own "import" phase, and handed to ``build``
+        -- which is why ``build`` takes an argument for those tabs and none for
+        the tabs whose module is already imported at startup. Importing inside
+        ``build`` instead would fold the two costs into one figure, and telling
+        them apart is the open question of #249: on a PyOxidizer bundle the
+        first use of a tab resolves its module out of the embedded blob (over a
+        translocated read-only mount, when the .app was left in Downloads),
+        while construction is the widget, its filters and its DB connection.
+        The second open of the same tab reads ``import=0ms``, the module being
+        in ``sys.modules`` by then, so two lines for one tab answer "is the
+        wait the import?" on their own.
+
+        Returns the page, or None when ``build`` declined to produce one, or
+        when a single-instance tab was already open and was simply shown.
+        """
+        if not allow_multiple and name in self.nb_tab_names:
+            # Already open: switching costs nothing, and there is nothing to
+            # measure. Building the page anyway would hand a widget to
+            # add_and_display_tab that it discards, leaving the paint watcher
+            # attached to something never shown -- so no paint would arrive and
+            # the backstop would log a misleading "not-painted total=10000ms"
+            # ten seconds later, with the stall monitor running throughout.
+            self.add_and_display_tab(None, name, allow_multiple=False)
+            return None
+
+        profiler = TabOpenProfiler(name)
+        profiler.watch_ui_stalls()
+
+        imported = None
+        if module is not None:
+            with profiler.phase("import"):
+                imported = import_module(module)
+
+        with profiler.phase("construct"):
+            page = build() if imported is None else build(imported)
+
+        if page is None:
+            profiler.result()  # stops the stall monitor started above
+            return None
+
+        profiler.watch_first_paint(page)
+        with profiler.phase("add_tab"):
+            # add_and_display_tab appends to self.threads itself.
+            self.add_and_display_tab(page, name, allow_multiple=allow_multiple)
+
+        # Deferred to the first paint: reporting here would measure everything
+        # except the interval the user actually waits through (issue #249).
+        profiler.report_when_painted(log)
+        return page
 
     def display_tab(self, new_tab_name) -> None:
         """Displays the indicated tab."""
@@ -240,15 +332,25 @@ class fpdb(QMainWindow):
         self.nb.setCurrentIndex(tab_no)
 
     def dia_about(self, widget, data=None) -> None:
+        """Show the legal notice, and point at the tab that has the details.
+
+        The box keeps the licence text it always carried, but the version and
+        environment facts a bug report needs now live in the Version tab
+        (issue #226) rather than being squeezed into a modal that cannot be
+        copied from.
+        """
+        from fpdb_3_legacy import version_info
+
         QMessageBox.about(
             self,
-            f"FPDB{VERSION!s}",
-            "Copyright 2008-2023. See contributors.txt for details"
+            f"FPDB {VERSION!s}",
+            f"FPDB {VERSION} ({version_info.detect_packaging()})\n\n"
+            "Copyright 2008-2023. See contributors.txt for details.\n"
             "You are free to change, and distribute original or changed versions "
-            "of fpdb within the rules set out by the license"
-            "https://github.com/jejellyroll-fr/fpdb-3"
-            "\n"
-            "Your config file is: " + self.config.file,
+            "of fpdb within the rules set out by the license.\n"
+            f"{version_info.REPOSITORY_URL}\n\n"
+            f"Your config file is: {self.config.file}\n\n"
+            "See Help > Version for the full version and environment report.",
         )
 
     def dia_advanced_preferences(self, widget, data=None) -> None:
@@ -915,6 +1017,87 @@ class fpdb(QMainWindow):
                 "Re-start fpdb to use this option.",
             )
 
+    def help_research_omaha(self, widget, data=None) -> None:
+        """Open the Omaha reading of the Research Browser (#353).
+
+        The quick start teaches the browser with Hold'em examples, and the one
+        view that cannot work on a four-card game is the one it leads with. An
+        Omaha player deserves an entry of their own rather than a guide that
+        keeps saying "not for you".
+        """
+        from fpdb_3_legacy import help_links
+
+        if not help_links.open_help("research-omaha"):
+            self.info_box(
+                "Research Browser for Omaha",
+                f"The guide is published at {help_links.DOCS_URL}/research-omaha.md",
+            )
+
+    def dia_rebuild_analytics(self, widget, data=None) -> None:
+        """Re-derive the analytics rows this database is missing (#351).
+
+        A database imported before the analytics layers existed holds hands and
+        actions but none of the rows derived from them, so every Research
+        Browser question answers "0 decisions" and the context-aware HUD panels
+        have nothing to read. The rebuild has existed since #305 and nothing
+        called it: only the demo-workspace tool did, which is no help to a user
+        with their own history.
+        """
+        from fpdb_3_legacy.analytics_lifecycle import rebuildable_subsystems, subsystems_ahead_of_code
+        from fpdb_3_legacy.analytics_rebuild import rebuild_subsystems
+
+        if not self.obtain_global_lock("dia_rebuild_analytics"):
+            self.warning_box(
+                "Cannot open Database Maintenance window because"
+                " other windows have been opened. Re-start fpdb to use this option.",
+            )
+            return
+        try:
+            # Deliberately not stale_subsystems(): that list includes rows a
+            # *newer* fpdb wrote, which this version cannot read as current but
+            # must not overwrite with its own older rules either.
+            stale = list(rebuildable_subsystems(self.db))
+            ahead = list(subsystems_ahead_of_code(self.db))
+            if ahead:
+                self.warning_box(
+                    "These analytics rows were written by a newer version of fpdb and are left "
+                    f"untouched, because re-deriving them here would replace them with older "
+                    f"rules:\n\n    {', '.join(ahead)}\n\n"
+                    "Upgrade fpdb to read them.",
+                    "Rebuild Analytics Data",
+                )
+            if not stale:
+                self.info_box("Rebuild Analytics Data", "There is nothing for this version to rebuild.")
+                return
+            confirm = QMessageBox(
+                QMessageBox.Warning,
+                "Rebuild Analytics Data",
+                "Confirm rebuilding the analytics data",
+                QMessageBox.Yes | QMessageBox.No,
+                self,
+            )
+            confirm.setInformativeText(
+                f"These subsystems were derived by older rules, or never derived at all:\n\n"
+                f"    {', '.join(stale)}\n\n"
+                "Re-deriving them reads the hands already stored -- no hand history files are "
+                "needed and no hand ids change. It can take a while on a large database.",
+            )
+            if confirm.exec() != QMessageBox.Yes:
+                log.info("User cancelled rebuilding analytics data")
+                return
+            log.info("Rebuilding analytics data: %s", stale)
+            result = rebuild_subsystems(self.db, self.config, stale)
+            log.info("Analytics rebuild finished: %s", result)
+            summary = f"{result.rebuilt} of {result.scanned} hands re-derived."
+            if result.failed:
+                # Named rather than buried in the log: a rebuild that silently
+                # derived nothing is what left the Research Browser empty in the
+                # first place.
+                summary += f"\n\n{result.failed} hand(s) failed. First: {result.failures[0]}"
+            self.info_box("Rebuild Analytics Data", summary)
+        finally:
+            self.release_global_lock()
+
     def dia_rebuild_indexes(self, widget, data=None) -> None:
         if self.obtain_global_lock("dia_rebuild_indexes"):
             self.dia_confirm = QMessageBox(
@@ -1359,37 +1542,35 @@ class fpdb(QMainWindow):
                 ],
             )
             self.display_config_created_dialogue = False
-        elif self.config.wrongConfigVersion:
-            diaConfigVersionWarning = QDialog()
-            diaConfigVersionWarning.setWindowTitle(_("Strong Warning - Local configuration out of date"))
-            diaConfigVersionWarning.setLayout(QVBoxLayout())
-            label = QLabel("\nYour local configuration file needs to be updated.")
-            diaConfigVersionWarning.layout().addWidget(label)
-            label = QLabel(
-                "\nYour local configuration file needs to be updated."
-                " This error is not necessarily fatal but it is strongly recommended that you update the configuration.",
+        if self.config.wrongConfigVersion or self.config.config_reference_errors:
+            warning = QMessageBox(self)
+            warning.setIcon(QMessageBox.Warning)
+            warning.setWindowTitle(_("Configuration needs attention"))
+            warning.setText(
+                f"Configuration: {self.config.file}\n"
+                f"Version {self.config.general['version']}; expected {Configuration.CONFIG_VERSION}."
             )
-            diaConfigVersionWarning.layout().addWidget(label)
-            label = QLabel(
-                "To create a new configuration, see:"
-                " fpdb.sourceforge.net/apps/mediawiki/fpdb/index.php?title=Reset_Configuration",
+            warning.setInformativeText(
+                "Upgrade adds missing HUD definitions and repairs known renamed references, "
+                "while preserving existing profiles, layouts, sites, screen names and favourite seats. "
+                "A separate backup is saved before writing. Unknown versions or unresolved references "
+                "require manual review."
             )
-            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            diaConfigVersionWarning.layout().addWidget(label)
-            label = QLabel(
-                "A new configuration will destroy all personal settings"
-                " (hud layout, site folders, screennames, favourite seats).\n",
-            )
-            diaConfigVersionWarning.layout().addWidget(label)
-            label = QLabel(_("To keep existing personal settings, you must edit the local file."))
-            diaConfigVersionWarning.layout().addWidget(label)
-            label = QLabel(_("See the release note for information about the edits needed"))
-            diaConfigVersionWarning.layout().addWidget(label)
-            btns = QDialogButtonBox(QDialogButtonBox.Ok)
-            btns.accepted.connect(diaConfigVersionWarning.accept)
-            diaConfigVersionWarning.layout().addWidget(btns)
-            diaConfigVersionWarning.exec()
-            self.config.wrongConfigVersion = False
+            warning.setDetailedText("\n".join(self.config.config_reference_errors))
+            warning.setStandardButtons(QMessageBox.Close)
+            upgrade = None
+            from fpdb_3_legacy.config_migrations import MIGRATIONS
+
+            if any(old == self.config.general["version"] for old, _new, _step in MIGRATIONS):
+                upgrade = warning.addButton(_("Back up and upgrade"), QMessageBox.AcceptRole)
+            warning.exec()
+            if upgrade is not None and warning.clickedButton() is upgrade:
+                try:
+                    backup = self.config.upgrade_config()
+                    self.config = Configuration.Config(file=self.config.file, dbname=options.dbname)
+                    self.info_box("Configuration upgraded", [f"Backup saved to {backup}"])
+                except (OSError, ValueError) as exc:
+                    self.warning_box(f"Configuration upgrade failed: {exc}")
 
         # Set up application settings
         self.settings = {}
@@ -1402,7 +1583,9 @@ class fpdb(QMainWindow):
         self.settings.update({"cl_options": cl_options})
         self.settings.update(self.config.get_db_parameters())
         self.settings.update(self.config.get_import_parameters())
-        self.settings.update(self.config.get_default_paths())
+        # Default-path resolution may inspect fallback locations when a saved
+        # room path is stale. Keep profile loading passive; import entry points
+        # resolve paths only when the user actually opens/starts that workflow.
 
         # Set up SQL and connect to the database
         self.sql = SQL.Sql(db_server=self.settings["db-server"])
@@ -1466,11 +1649,24 @@ class fpdb(QMainWindow):
                 self,
             )
             diaDbVersionWarning.setInformativeText(
-                "This error is not necessarily fatal but it is strongly"
-                " recommended that you recreate the tables by using the Database menu."
-                " Not doing this will likely lead to misbehavior including fpdb crashes, corrupt data, etc.",
+                "Recreating tables deletes ALL imported hands and statistics; you will need to reimport "
+                "your original histories. No automatic schema upgrade is available for this database. "
+                "Back up your database and keep your hand histories before recreating tables. "
+                "You can export a diagnostic text dump first; it is not a restorable database backup.",
             )
+            export = diaDbVersionWarning.addButton("Export text dump…", QMessageBox.ActionRole)
             diaDbVersionWarning.exec()
+            if diaDbVersionWarning.clickedButton() is export:
+                from PySide6.QtWidgets import QFileDialog
+
+                path, _filter = QFileDialog.getSaveFileName(self, "Export database", "database-dump.txt")
+                if path:
+                    try:
+                        result = self.db.dumpDatabase()
+                        with open(path, "w", encoding="utf-8") as stream:
+                            stream.write(result)
+                    except Exception as exc:
+                        self.warning_box(f"Database export failed. Keep the original database: {exc}")
 
         # Update the status bar with the database connection status
         if self.db is not None and self.db.is_connected():
@@ -1635,35 +1831,35 @@ class fpdb(QMainWindow):
 
     def tab_auto_import(self, widget, data=None) -> None:
         """Opens the auto import tab."""
-        new_aimp_thread = GuiAutoImport.GuiAutoImport(self.settings, self.config, self.sql, self)
-        self.threads.append(new_aimp_thread)
-        self.add_and_display_tab(new_aimp_thread, "HUD")
+        new_aimp_thread = self.open_tab(
+            "HUD",
+            lambda: GuiAutoImport.GuiAutoImport(self.settings, self.config, self.sql, self),
+        )
         if options.autoimport:
             new_aimp_thread.startClicked(new_aimp_thread.startButton, "autostart")
             options.autoimport = False
 
     def tab_bulk_import(self, widget, data=None) -> None:
         """Opens a tab for bulk importing."""
-        new_import_thread = GuiBulkImport.GuiBulkImport(self.settings, self.config, self.sql, self)
-        self.threads.append(new_import_thread)
-        self.add_and_display_tab(new_import_thread, "Bulk Import")
+        # Bulk Import still gets its detected/custom default, but resolving it
+        # here avoids probing protected folders during ordinary application
+        # startup and profile refreshes.
+        self.settings.update(self.config.get_default_paths())
+        self.open_tab(
+            "Bulk Import",
+            lambda: GuiBulkImport.GuiBulkImport(self.settings, self.config, self.sql, self),
+        )
 
     def tab_coinpoker_capture(self, widget, data=None) -> None:
         """Open the CoinPoker live packet-capture tab."""
         if is_site_disabled("CoinPoker"):
-            # The menu no longer offers this tab; refuse the stale entry points
-            # (saved layouts, scripted calls) rather than starting a capture.
             log.info("CoinPoker support is disabled; not opening the live capture tab")
             return
-        new_thread = GuiCoinPokerCapture.GuiCoinPokerCapture(self.config, self)
-        self.threads.append(new_thread)
-        self.add_and_display_tab(new_thread, "CoinPoker Capture")
+        self.open_tab("CoinPoker Capture", lambda: GuiCoinPokerCapture.GuiCoinPokerCapture(self.config, self))
 
     def tab_auto_notes_workbench(self, widget, data=None) -> None:
         """Open the automatic notes workbench tab."""
-        new_thread = GuiAutoNotesWorkbench.GuiAutoNotesWorkbench(self.config, self)
-        self.threads.append(new_thread)
-        self.add_and_display_tab(new_thread, "Auto Notes")
+        self.open_tab("Auto Notes", lambda: GuiAutoNotesWorkbench.GuiAutoNotesWorkbench(self.config, self))
 
     # def tab_tourney_import(self, widget, data=None):
     #     """opens a tab for bulk importing tournament summaries"""
@@ -1675,29 +1871,103 @@ class fpdb(QMainWindow):
     # end def tab_import_imap_summaries
 
     def tab_ring_player_stats(self, widget, data=None) -> None:
-        # This package imports Matplotlib and scans every system font. Frozen
-        # builds cannot reliably reuse that scan, so importing it at startup
-        # delayed Auto Import even though no graphing tab had been requested.
-        from fpdb_3_legacy import GuiRingPlayerStats
+        # Imported lazily by open_tab, which times it separately: the package
+        # pulls in the whole ring-stats view tree, and most sessions never open
+        # this tab. The cost used to be described as a Matplotlib font scan,
+        # which stopped being true with the move to PyQtGraph (#228) and sent a
+        # later performance analysis (#249) after a cost that no longer exists.
+        self.open_tab(
+            "Ring Player Stats",
+            lambda module: module.GuiRingPlayerStats(self.config, self.sql, self),
+            module="fpdb_3_legacy.GuiRingPlayerStats",
+        )
 
-        new_ps_thread = GuiRingPlayerStats.GuiRingPlayerStats(self.config, self.sql, self)
-        self.threads.append(new_ps_thread)
-        self.add_and_display_tab(new_ps_thread, "Ring Player Stats")
+    def tab_research_browser(self, widget, data=None) -> None:
+        # Lazily imported like the other tabs: the browser pulls the analytics
+        # engine and its view tree, and most sessions never open this tab.
+        self.open_tab(
+            "Research Browser",
+            lambda module: module.GuiResearchBrowser(self.config, self.sql, self),
+            module="fpdb_3_legacy.GuiResearchBrowser",
+        )
+
+    def tab_study_explorer(self, widget, data=None) -> None:
+        """Open the spot-first Study Explorer (#360)."""
+
+        def build_explorer(module):
+            explorer = module.GuiStudyExplorer(self.config, self.sql, self)
+            explorer.study_opened.connect(self._open_study_dashboard)
+            explorer.differences_requested.connect(self._open_study_differences)
+            return explorer
+
+        self.open_tab(
+            "Study Explorer",
+            build_explorer,
+            module="fpdb_3_legacy.GuiStudyExplorer",
+        )
+
+    def _open_study_dashboard(self, selection) -> None:
+        """Open the synchronized dashboard for a Study Explorer selection (#361)."""
+        self.open_tab(
+            f"Study · {selection.study.title}",
+            lambda module: module.GuiStudyDashboard(
+                self.config,
+                self.sql,
+                self,
+                selection=selection,
+            ),
+            module="fpdb_3_legacy.GuiStudyDashboard",
+        )
+
+    def _open_study_differences(self) -> None:
+        """Open the curated Hero-versus-Field discovery page (#365)."""
+
+        def build_differences(module):
+            differences = module.GuiStudyDifferences(self.config, self.sql, self)
+            differences.study_requested.connect(self._open_difference_study)
+            return differences
+
+        self.open_tab(
+            "Biggest Differences vs Field",
+            build_differences,
+            module="fpdb_3_legacy.GuiStudyDifferences",
+        )
+
+    def _open_difference_study(self, detail) -> None:
+        """Open the study and preserve the clicked difference context (#365)."""
+
+        def build_dashboard(module):
+            from fpdb_3_legacy.research_study_dashboard import StudyDashboardModel
+
+            model = StudyDashboardModel(detail.selection)
+            model.set_active_panel(detail.panel_id)
+            for name, value in detail.cross_filters.items():
+                try:
+                    model.add_cross_filter(name, value)
+                except ValueError:
+                    # A dimension can be descriptive without being a legal
+                    # query filter; the study itself remains a valid target.
+                    continue
+            model.set_focus_filters(detail.focus_filters)
+            return module.GuiStudyDashboard(self.config, self.sql, self, model=model)
+
+        self.open_tab(
+            f"Study · {detail.row.spot}",
+            build_dashboard,
+            module="fpdb_3_legacy.GuiStudyDashboard",
+        )
 
     def tab_opponents_report(self, widget, data=None) -> None:
-        new_thread = GuiOpponentsReport.GuiOpponentsReport(self.config, self.sql, self)
-        self.threads.append(new_thread)
-        self.add_and_display_tab(new_thread, "Opponents Report")
+        self.open_tab("Opponents Report", lambda: GuiOpponentsReport.GuiOpponentsReport(self.config, self.sql, self))
 
     def tab_tourney_player_stats(self, widget, data=None) -> None:
-        new_ps_thread = GuiTourneyPlayerStats.GuiTourneyPlayerStats(self.config, self.db, self.sql, self)
-        self.threads.append(new_ps_thread)
-        self.add_and_display_tab(new_ps_thread, "Tourney Stats")
+        self.open_tab(
+            "Tourney Stats",
+            lambda: GuiTourneyPlayerStats.GuiTourneyPlayerStats(self.config, self.db, self.sql, self),
+        )
 
     def tab_tourney_viewer_stats(self, widget, data=None) -> None:
-        new_thread = GuiTourHandViewer.TourHandViewer(self.config, self.sql, self)
-        self.threads.append(new_thread)
-        self.add_and_display_tab(new_thread, "Tourney Viewer")
+        self.open_tab("Tourney Viewer", lambda: GuiTourHandViewer.TourHandViewer(self.config, self.sql, self))
 
     # def tab_positional_stats(self, widget, data=None):
     #     new_ps_thread = GuiPositionalStats.GuiPositionalStats(self.config, self.sql)
@@ -1706,24 +1976,46 @@ class fpdb(QMainWindow):
     #     self.add_and_display_tab(ps_tab, "Positional Stats")
 
     def tab_session_stats(self, widget, data=None) -> None:
-        from fpdb_3_legacy import GuiSessionViewer
+        def build(module):
+            colors = self.get_theme_colors()
+            return module.GuiSessionViewer(self.config, self.sql, self, self, colors=colors)
 
-        colors = self.get_theme_colors()
-        new_ps_thread = GuiSessionViewer.GuiSessionViewer(self.config, self.sql, self, self, colors=colors)
-        self.threads.append(new_ps_thread)
-        self.add_and_display_tab(new_ps_thread, "Session Stats")
+        self.open_tab("Session Stats", build, module="fpdb_3_legacy.GuiSessionViewer")
 
     def tab_hand_viewer(self, widget, data=None) -> None:
-        new_ps_thread = GuiHandViewer.GuiHandViewer(self.config, self.sql, self)
-        self.threads.append(new_ps_thread)
-        self.add_and_display_tab(new_ps_thread, "Hand Viewer")
+        self.open_tab("Hand Viewer", lambda: GuiHandViewer.GuiHandViewer(self.config, self.sql, self))
+
+    def tab_version_info(self, widget=None, data=None) -> None:
+        """Displays the Version / About tab (issue #226).
+
+        Imported lazily like the other tabs so startup does not pay for a view
+        most sessions never open. ``allow_multiple=False``: the tab is a static
+        snapshot of the running build, so a second copy would only duplicate the
+        first.
+        """
+        def build(module):
+            return module.GuiVersionInfo(
+                config=self.config,
+                db=getattr(self, "db", None),
+                version=VERSION,
+                parent=self,
+            )
+
+        self.open_tab("Version", build, allow_multiple=False, module="fpdb_3_legacy.GuiVersionInfo")
 
     def tab_main_help(self, widget, data=None) -> None:
-        """Displays a tab with the main fpdb help screen."""
+        """Displays a tab with the main fpdb help screen.
+
+        This is the landing tab at startup, so it names the running build: it
+        used to greet the user without ever saying which version had been
+        launched (issue #226). The details themselves live in the Version tab.
+        """
         mh_tab = QLabel(
             (
-                """
-                        Welcome to Fpdb!
+                f"""
+                        Welcome to Fpdb {VERSION}!
+
+                        Open Help > Version for the full version, packaging and environment report.
 
                         This program is currently in an alpha-state, so our database format is still sometimes changed.
                         You should therefore always keep your hand history files so that you can re-import
@@ -1738,7 +2030,7 @@ class fpdb(QMainWindow):
                         and mit.txt in the fpdb installation directory."""
             ),
         )
-        self.add_and_display_tab(mh_tab, "Help")
+        self.open_tab("Help", lambda: mh_tab)
 
     def get_theme_colors(self):
         """Returns a dictionary containing the theme colors used in the application.
@@ -1762,29 +2054,30 @@ class fpdb(QMainWindow):
 
     def tabGraphViewer(self, widget, data=None) -> None:
         """Opens a graph viewer tab."""
-        from fpdb_3_legacy import GuiGraphViewer
 
-        colors = self.get_theme_colors()
-        new_gv_thread = GuiGraphViewer.GuiGraphViewer(self.sql, self.config, self, colors=colors)
-        self.threads.append(new_gv_thread)
-        self.add_and_display_tab(new_gv_thread, "Graphs")
+        def build(module):
+            colors = self.get_theme_colors()
+            return module.GuiGraphViewer(self.sql, self.config, self, colors=colors)
+
+        self.open_tab("Graphs", build, module="fpdb_3_legacy.GuiGraphViewer")
 
     def tabTourneyGraphViewer(self, widget, data=None) -> None:
         """Opens a graph viewer tab."""
-        from fpdb_3_legacy import GuiTourneyGraphViewer
 
-        colors = self.get_theme_colors()
-        new_gv_thread = GuiTourneyGraphViewer.GuiTourneyGraphViewer(self.sql, self.config, self, colors=colors)
-        self.threads.append(new_gv_thread)
-        self.add_and_display_tab(new_gv_thread, "Tourney Graphs")
+        def build(module):
+            colors = self.get_theme_colors()
+            return module.GuiTourneyGraphViewer(self.sql, self.config, self, colors=colors)
+
+        self.open_tab("Tourney Graphs", build, module="fpdb_3_legacy.GuiTourneyGraphViewer")
 
     def tabStatsInfo(self, widget, data=None) -> None:
         """Opens a statistics guide tab."""
-        from fpdb_3_legacy import GuiStatsInfo
 
-        new_si_tab = GuiStatsInfo.GuiStatsInfo(self.config, self)
-        self.threads.append(new_si_tab)
-        self.add_and_display_tab(new_si_tab, "Stats Guide")
+        self.open_tab(
+            "Stats Guide",
+            lambda module: module.GuiStatsInfo(self.config, self),
+            module="fpdb_3_legacy.GuiStatsInfo",
+        )
 
     # def tabStove(self, widget, data=None):
     #     """opens a tab for poker stove"""
@@ -1813,7 +2106,9 @@ class fpdb(QMainWindow):
     def info_box(self, str1, str2):
         diapath = QMessageBox(self)
         diapath.setWindowTitle(str1)
-        diapath.setText(str2)
+        if isinstance(str2, (list, tuple)):
+            str2 = "\n".join(str(item) for item in str2)
+        diapath.setText(str(str2))
         return diapath.exec()
 
     def warning_box(self, string, diatitle="FPDB WARNING"):
@@ -1862,6 +2157,17 @@ class fpdb(QMainWindow):
             self.threads.remove(item)
 
         if item is not None:
+            # Stop any QThreads before destruction: a widget removed from a
+            # QTabWidget does not receive closeEvent, so DbWorker threads (ring
+            # stats) would otherwise keep running as zombies.
+            shutdown = getattr(item, "shutdown_workers", None)
+            if callable(shutdown):
+                shutdown()
+            # Only tabs that created their own connection implement this hook.
+            # GuiTourneyPlayerStats shares the main window's connection.
+            close_database = getattr(item, "close_owned_database", None)
+            if callable(close_database):
+                close_database()
             item.deleteLater()
 
     def __init__(self) -> None:
@@ -2086,8 +2392,48 @@ class CustomTitleBar(QWidget):
             self.main_window.oldPos = event.globalPos()
 
 
+def warn_if_app_translocated() -> bool:
+    """Tell the user to install the app properly when macOS has quarantined it.
+
+    A downloaded .app run from Downloads is started by macOS from a read-only,
+    randomly named mount with a throwaway identity. Nothing works the way it
+    is documented to: Accessibility and Automation grants do not stick, so the
+    HUD reads no table windows, and the failure looks like a bug in fpdb
+    rather than a place the app was left. There is no programmatic fix -- the
+    user has to move it -- so this says so, once, at startup.
+
+    Returns whether the warning was shown, so a test can check the decision
+    without a dialog.
+    """
+    from fpdb_3_legacy.hud_diagnostics import bundle_path, is_app_translocated
+
+    if sys.platform != "darwin" or not is_app_translocated():
+        return False
+
+    bundle = bundle_path() or sys.executable
+    log.error("Refusing to pretend this works: fpdb is running translocated from %s", bundle)
+    QMessageBox.warning(
+        None,
+        "Move FPDB to Applications",
+        "macOS is running FPDB from a temporary, read-only copy (App Translocation), "
+        "which happens when a downloaded app is launched from where it was unzipped.\n\n"
+        "In this state macOS gives FPDB a throwaway identity, so the Accessibility and "
+        "Automation permissions the HUD needs cannot be granted to it and table windows "
+        "will not be detected.\n\n"
+        "Quit FPDB, move FPDB.app into /Applications, and launch it from there.",
+    )
+    return True
+
+
 if __name__ == "__main__":
     import time
+
+    from fpdb_3_legacy.hud_diagnostics import ROLE_MAIN, log_process_identity
+
+    # One banner per launch, before anything can fail: which build ran, from
+    # where, as which process. The HUD child inherits this session id, so both
+    # processes of one launch can be told apart from a previous run's.
+    log_process_identity(log, ROLE_MAIN)
 
     # qt_material import moved to ThemeManager
 
@@ -2106,6 +2452,8 @@ if __name__ == "__main__":
 
     try:
         app = QApplication([])
+
+        warn_if_app_translocated()
 
         # Initialize ThemeManager and apply saved theme
         from fpdb_3_legacy.ThemeManager import ThemeManager

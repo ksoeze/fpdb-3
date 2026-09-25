@@ -86,16 +86,16 @@ def test_base_acquire_none_source_becomes_unknown() -> None:
 
 
 @requires_fcntl
-def test_fcntl_hashed_name_only_strips_literal_sequence() -> None:
-    # Characterization: the sanitizing regex is a literal sequence, not a
-    # character class, so individual bad characters are left untouched and a
-    # plain name is returned unchanged.
-    lock = InterProcessLockFcntl(name="plain_name_123")
-    assert lock.getHashedName() == "plain_name_123"
-    # Individual special characters are NOT stripped (regex lacks [ ]).
-    assert lock.getHashedName.__self__.name == "plain_name_123"
-    lock2 = InterProcessLockFcntl(name="a/b:c")
-    assert "/" in lock2.getHashedName()
+def test_fcntl_hashed_name_strips_characters_a_path_cannot_hold() -> None:
+    # This characterized the opposite until the regex was fixed: it was a
+    # literal sequence rather than a character class, so it replaced the
+    # exact string /?<>\:;*|'"^=.[] and nothing else, leaving every real name
+    # untouched. A name carrying a separator then built a path into another
+    # directory, where a second process looking for the same lock would not
+    # find it -- and a lock that two processes look for in two places
+    # excludes neither.
+    assert InterProcessLockFcntl(name="plain_name_123").getHashedName() == "plain_name_123"
+    assert InterProcessLockFcntl(name="a/b:c").getHashedName() == "a_b_c"
 
 
 @requires_fcntl
@@ -129,7 +129,7 @@ def test_socket_lock_portno_is_deterministic() -> None:
     # computed in __init__.
     name = _unique_name("sock")
     lock = InterProcessLockSocket(name=name)
-    assert 65530 - 32749 <= lock.portno <= 65530
+    assert 20000 <= lock.portno < 20000 + 12768
 
 
 def test_main_no_args_prints_help_returns_zero(capsys) -> None:

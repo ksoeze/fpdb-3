@@ -18,19 +18,35 @@ from __future__ import annotations
 # This code once was in GuiReplayer.py and was split up in this and the former by zarturo.
 # import L10n
 # _ = L10n.get_translation()
+import contextlib
 from decimal import Decimal
 from functools import partial
 from io import StringIO
 from typing import Any
 
 from PySide6.QtCore import QCoreApplication, QSortFilterProxyModel, Qt
-from PySide6.QtGui import QBrush, QColor, QPainter, QPixmap, QStandardItem, QStandardItemModel
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QDoubleValidator,
+    QIntValidator,
+    QPainter,
+    QPixmap,
+    QStandardItem,
+    QStandardItemModel,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QProgressDialog,
@@ -39,14 +55,84 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableView,
     QVBoxLayout,
+    QWidget,
 )
 
 from fpdb_3_legacy import SQL, Card, Configuration, Database, Deck, Filters, GuiReplayer, Hand, gui_empty_state
+from fpdb_3_legacy.analytics_query import escape_literal_percent
+from fpdb_3_legacy.hand_viewer_filters import build_filter_clauses, required_analytics_subsystems
+from fpdb_3_legacy.holdem_classes import RANKS, grid_labels
 from fpdb_3_legacy.i18n import gettext as _
 from fpdb_3_legacy.localized_formats import format_currency, format_datetime, format_number
 from fpdb_3_legacy.loggingFpdb import get_logger
 
 log = get_logger("gui_hand_viewer")
+
+
+class StartingHandPickerDialog(QDialog):
+    """A multi-select 13x13 Hold'em class picker with common shortcuts."""
+
+    def __init__(self, selected: set[str] | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(_("Starting-hand range"))
+        self._buttons: dict[str, QPushButton] = {}
+        self._selected = set(selected or ())
+        layout = QVBoxLayout(self)
+        shortcuts = QHBoxLayout()
+        for label, predicate in (
+            (_("Pairs"), lambda hand: len(hand) == 2),
+            (_("Suited"), lambda hand: hand.endswith("s")),
+            (_("Offsuit"), lambda hand: hand.endswith("o")),
+            (_("Broadway"), lambda hand: hand[0] in "AKQJT" and hand[1] in "AKQJT"),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _checked=False, match=predicate: self._select_matching(match))
+            shortcuts.addWidget(button)
+        clear = QPushButton(_("Clear"))
+        clear.clicked.connect(lambda: self._select_matching(lambda _hand: False))
+        shortcuts.addWidget(clear)
+        invert = QPushButton(_("Invert"))
+        invert.clicked.connect(self._invert)
+        shortcuts.addWidget(invert)
+        layout.addLayout(shortcuts)
+
+        grid = QGridLayout()
+        grid.setSpacing(2)
+        grid.addWidget(QLabel(""), 0, 0)
+        for column, rank in enumerate(RANKS, start=1):
+            grid.addWidget(QLabel(rank), 0, column)
+            grid.addWidget(QLabel(rank), column, 0)
+        for row, hand_labels in enumerate(grid_labels(), start=1):
+            for column, hand in enumerate(hand_labels, start=1):
+                button = QPushButton(hand)
+                button.setCheckable(True)
+                button.setChecked(hand in self._selected)
+                button.setFixedSize(42, 28)
+                button.toggled.connect(lambda checked, value=hand: self._set_selected(value, checked))
+                self._buttons[hand] = button
+                grid.addWidget(button, row, column)
+        layout.addLayout(grid)
+        controls = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        controls.accepted.connect(self.accept)
+        controls.rejected.connect(self.reject)
+        layout.addWidget(controls)
+
+    def _set_selected(self, hand: str, selected: bool) -> None:
+        if selected:
+            self._selected.add(hand)
+        else:
+            self._selected.discard(hand)
+
+    def _select_matching(self, predicate) -> None:
+        self._selected = {hand for hand in self._buttons if predicate(hand)}
+        for hand, button in self._buttons.items():
+            button.setChecked(hand in self._selected)
+
+    def _invert(self) -> None:
+        self._select_matching(lambda hand: hand not in self._selected)
+
+    def selected_hands(self) -> set[str]:
+        return set(self._selected)
 
 
 class GuiHandViewer(QSplitter):
@@ -85,9 +171,18 @@ class GuiHandViewer(QSplitter):
         self.filters.registerButton1Callback(self.loadHands)
         self.filters.registerCardsCallback(self.filter_cards_cb)
 
+        self._starting_hands: set[str] = set()
+        self.filterPanel = QWidget()
+        self.filterPanelLayout = QVBoxLayout(self.filterPanel)
+        self.filterPanelLayout.setContentsMargins(0, 0, 0, 0)
+        self.filterPanelLayout.addWidget(self.filters)
+        self.advancedFilters = self._build_advanced_filters()
+        self.filterPanelLayout.addWidget(self.advancedFilters)
+        self.filterPanelLayout.addStretch(1)
+
         scroll = QScrollArea()
         scroll.setObjectName("filterSidebar")
-        scroll.setWidget(self.filters)
+        scroll.setWidget(self.filterPanel)
         # Without this the scroll area leaves the filter widget at a collapsed
         # height, squashing list-heavy frames (e.g. the CATEGORY checkboxes) to a
         # few pixels tall. Matches GuiTourneyPlayerStats.
@@ -126,6 +221,7 @@ class GuiHandViewer(QSplitter):
             "Total Pot": 15,
             "Rake": 16,
             "SiteHandNo": 17,
+            "Splash": 18,
         }
         self.view = QTableView()
         self.view.setSelectionBehavior(QTableView.SelectRows)
@@ -157,14 +253,17 @@ class GuiHandViewer(QSplitter):
                 "Total Pot",
                 "Rake",
                 "SiteHandId",
+                "Splash",
             ],
         )
 
         self.view.doubleClicked.connect(self.row_activated)
         setattr(self.view, "contextMenuEvent", self.contextMenu)
+
         def resize_rows(_index, start, end) -> None:
             for row in range(start, end + 1):
                 self.view.resizeRowToContents(row)
+
         self.filterModel.rowsInserted.connect(
             resize_rows,
         )
@@ -194,7 +293,6 @@ class GuiHandViewer(QSplitter):
         self.flagCashout = QCheckBox("CO$")
         self.flagBombPot = QCheckBox("Bomb")
         self.flagDoubleBoard = QCheckBox("2xB")
-        self.flagSplashPot = QCheckBox("Splash")
         _flag_tips = {
             "AI": "went all-in",
             "SD": "saw showdown",
@@ -202,7 +300,6 @@ class GuiHandViewer(QSplitter):
             "CO$": "EV cashout",
             "Bomb": "bomb pot",
             "2xB": "double board",
-            "Splash": "splash pot",
         }
         for cb in (
             self.flagAllIn,
@@ -211,16 +308,236 @@ class GuiHandViewer(QSplitter):
             self.flagCashout,
             self.flagBombPot,
             self.flagDoubleBoard,
-            self.flagSplashPot,
         ):
             cb.setToolTip(_("Filter: ") + _flag_tips[cb.text()])
             cb.stateChanged.connect(lambda _state: self.loadHands(None))
             self.pagerBox.addWidget(cb)
+        self.flagSplashPot = QComboBox()
+        self.flagSplashPot.addItem(_("All hands"), "all")
+        self.flagSplashPot.addItem(_("Splash pots only"), "only")
+        self.flagSplashPot.addItem(_("Exclude splash pots"), "exclude")
+        self.flagSplashPot.setToolTip(_("Filter: splash pot"))
+        self.flagSplashPot.currentIndexChanged.connect(lambda _index: self.loadHands(None))
+        self.pagerBox.addWidget(self.flagSplashPot)
         self.handsVBox.addLayout(self.pagerBox)
         self._update_pager()
 
         self.view.resizeColumnsToContents()
         self.view.setSortingEnabled(True)
+
+    def _build_advanced_filters(self) -> QGroupBox:
+        group = QGroupBox(_("Advanced review filters"))
+        grid = QGridLayout(group)
+        self.startingHandButton = QPushButton(_("Choose hands…"))
+        self.startingHandSummary = QLabel(_("All starting hands"))
+        self.startingHandButton.clicked.connect(self._choose_starting_hands)
+        grid.addWidget(QLabel(_("Hold'em starting hand")), 0, 0)
+        grid.addWidget(self.startingHandButton, 0, 1)
+        grid.addWidget(self.startingHandSummary, 0, 2)
+
+        self.exactCard1 = QComboBox()
+        self.exactCard2 = QComboBox()
+        cards = [f"{rank}{suit}" for rank in "AKQJT98765432" for suit in "shdc"]
+        for selector in (self.exactCard1, self.exactCard2):
+            selector.addItem(_("Any card"), None)
+            for card in cards:
+                selector.addItem(card, card)
+        grid.addWidget(QLabel(_("Exact known cards")), 1, 0)
+        exact_layout = QHBoxLayout()
+        exact_layout.addWidget(self.exactCard1)
+        exact_layout.addWidget(self.exactCard2)
+        grid.addLayout(exact_layout, 1, 1, 1, 2)
+
+        self.preflopFilter = QComboBox()
+        for label, value in (
+            (_("Any"), ""),
+            (_("VPIP"), "vpip"),
+            (_("Did not VPIP"), "not_vpip"),
+            (_("RFI"), "rfi"),
+            (_("Limp"), "limp"),
+            (_("Call open"), "call_open"),
+            (_("3-bet"), "three_bet"),
+            (_("4-bet"), "four_bet"),
+            (_("Squeeze"), "squeeze"),
+            (_("Faced open"), "faced_open"),
+            (_("Faced 3-bet"), "faced_three_bet"),
+            (_("Went all-in"), "all_in"),
+        ):
+            self.preflopFilter.addItem(label, value)
+        grid.addWidget(QLabel(_("Preflop")), 2, 0)
+        grid.addWidget(self.preflopFilter, 2, 1, 1, 2)
+
+        self.postflopFilter = QComboBox()
+        for label, value in (
+            (_("Any"), ""),
+            (_("Saw flop"), "saw_flop"),
+            (_("Saw turn"), "saw_turn"),
+            (_("Saw river"), "saw_river"),
+            (_("Bet"), "bet"),
+            (_("Called"), "call"),
+            (_("Raised"), "raise"),
+            (_("Checked"), "check"),
+            (_("Folded"), "fold"),
+            (_("Continuation bet"), "cbet"),
+            (_("Faced c-bet"), "faced_cbet"),
+            (_("Check-raise"), "check_raise"),
+            (_("Showdown"), "showdown"),
+        ):
+            self.postflopFilter.addItem(label, value)
+        grid.addWidget(QLabel(_("Postflop")), 3, 0)
+        grid.addWidget(self.postflopFilter, 3, 1, 1, 2)
+
+        self.potMinBB = QLineEdit()
+        self.potMinBB.setPlaceholderText(_("min BB"))
+        self.potMaxBB = QLineEdit()
+        self.potMaxBB.setPlaceholderText(_("max BB"))
+        self.netMinBB = QLineEdit()
+        self.netMinBB.setPlaceholderText(_("min BB"))
+        self.netMaxBB = QLineEdit()
+        self.netMaxBB.setPlaceholderText(_("max BB"))
+        self.stackMinBB = QLineEdit()
+        self.stackMinBB.setPlaceholderText(_("min BB"))
+        self.stackMaxBB = QLineEdit()
+        self.stackMaxBB.setPlaceholderText(_("max BB"))
+        self.playersMin = QLineEdit()
+        self.playersMin.setPlaceholderText(_("min"))
+        self.playersMax = QLineEdit()
+        self.playersMax.setPlaceholderText(_("max"))
+        for widget in (
+            self.potMinBB,
+            self.potMaxBB,
+            self.netMinBB,
+            self.netMaxBB,
+            self.stackMinBB,
+            self.stackMaxBB,
+        ):
+            widget.setValidator(QDoubleValidator(-1_000_000, 1_000_000, 4, widget))
+        for widget in (self.playersMin, self.playersMax):
+            widget.setValidator(QIntValidator(0, 100, widget))
+        for row, label, low, high in (
+            (4, _("Final pot (BB)"), self.potMinBB, self.potMaxBB),
+            (5, _("Net result (BB)"), self.netMinBB, self.netMaxBB),
+            (6, _("Effective stack (BB)"), self.stackMinBB, self.stackMaxBB),
+            (7, _("Players in hand"), self.playersMin, self.playersMax),
+        ):
+            bounds = QHBoxLayout()
+            bounds.addWidget(low)
+            bounds.addWidget(high)
+            grid.addWidget(QLabel(label), row, 0)
+            grid.addLayout(bounds, row, 1, 1, 2)
+
+        self.sizingBucketFilter = QComboBox()
+        self.sizingBucketFilter.addItem(_("Any sizing"), "")
+        for label, value in (
+            (_("Under 25% pot"), "under_25"),
+            (_("25–50% pot"), "25_50"),
+            (_("50–75% pot"), "50_75"),
+            (_("75–100% pot"), "75_100"),
+            (_("100–150% pot"), "100_150"),
+            (_("Over 150% pot"), "over_150"),
+        ):
+            self.sizingBucketFilter.addItem(label, value)
+        grid.addWidget(QLabel(_("Bet / raise sizing")), 8, 0)
+        grid.addWidget(self.sizingBucketFilter, 8, 1, 1, 2)
+
+        self.applyAdvancedFilters = QPushButton(_("Apply review filters"))
+        self.applyAdvancedFilters.clicked.connect(lambda: self.loadHands(None))
+        grid.addWidget(self.applyAdvancedFilters, 9, 0, 1, 3)
+        return group
+
+    def _choose_starting_hands(self) -> None:
+        dialog = StartingHandPickerDialog(self._starting_hands, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._starting_hands = dialog.selected_hands()
+            count = len(self._starting_hands)
+            self.startingHandSummary.setText(
+                _("All starting hands") if not count else _("{} classes selected").format(count)
+            )
+
+    @staticmethod
+    def _optional_number(widget, cast):
+        text = widget.text().strip()
+        if not text:
+            return None
+        if cast is float:
+            text = text.replace(",", ".")
+        return cast(text)
+
+    def _advanced_filter_values(self) -> dict[str, Any]:
+        values = {
+            "starting_hands": sorted(self._starting_hands),
+            "exact_card_1": self.exactCard1.currentData(),
+            "exact_card_2": self.exactCard2.currentData(),
+            "preflop": self.preflopFilter.currentData(),
+            "postflop": self.postflopFilter.currentData(),
+            "pot_min_bb": self._optional_number(self.potMinBB, float),
+            "pot_max_bb": self._optional_number(self.potMaxBB, float),
+            "net_min_bb": self._optional_number(self.netMinBB, float),
+            "net_max_bb": self._optional_number(self.netMaxBB, float),
+            "stack_min_bb": self._optional_number(self.stackMinBB, float),
+            "stack_max_bb": self._optional_number(self.stackMaxBB, float),
+            "sizing_bucket": self.sizingBucketFilter.currentData(),
+            "players_min": self._optional_number(self.playersMin, int),
+            "players_max": self._optional_number(self.playersMax, int),
+        }
+        for minimum, maximum, label in (
+            ("pot_min_bb", "pot_max_bb", "final pot"),
+            ("net_min_bb", "net_max_bb", "net result"),
+            ("stack_min_bb", "stack_max_bb", "effective stack"),
+            ("players_min", "players_max", "players in hand"),
+        ):
+            low, high = values[minimum], values[maximum]
+            if low is not None and high is not None and low > high:
+                raise ValueError(_("The minimum cannot exceed the maximum for {}.").format(label))
+        return values
+
+    def _analytics_filter_warning(self, filters: dict[str, Any]) -> str:
+        """Explain when selected filters depend on analytics rows that are not readable."""
+        required = required_analytics_subsystems(filters)
+        if not required:
+            return ""
+        try:
+            from fpdb_3_legacy.analytics_lifecycle import subsystem_statuses
+
+            statuses = subsystem_statuses(self.db)
+        except Exception:  # noqa: BLE001 - do not silently return a misleading empty result
+            log.warning("Could not verify analytics status for Hand Viewer filters", exc_info=True)
+            return _(
+                "The analytics status needed by these filters could not be verified. "
+                "No results were queried; check the database and rebuild analytics data before retrying.",
+            )
+
+        stale = [statuses[name] for name in required if statuses[name].is_stale]
+        if not stale:
+            return ""
+        older = [status.name for status in stale if status.recorded_version < status.code_version]
+        newer = [status.name for status in stale if status.recorded_version > status.code_version]
+        messages = []
+        if older:
+            messages.append(
+                _("These filters need missing or outdated analytics data: {names}.").format(
+                    names=", ".join(older),
+                )
+            )
+            messages.append(_("Use Database → Rebuild Analytics Data, then retry the filter."))
+        if newer:
+            messages.append(
+                _("These analytics rows were created by a newer fpdb version: {names}.").format(
+                    names=", ".join(newer),
+                )
+            )
+            messages.append(_("Upgrade fpdb before using these filters."))
+        messages.append(_("No hands were queried, to avoid presenting an incomplete result as empty."))
+        return "\n\n".join(messages)
+
+    def close_owned_database(self) -> None:
+        """Release the connection created for this tab."""
+        with contextlib.suppress(Exception):
+            if self.replayer is not None:
+                self.replayer.close()
+                self.replayer = None
+        with contextlib.suppress(Exception):
+            self.db.disconnect()
 
     def init_card_images(self):
         suits = ("s", "h", "d", "c")
@@ -266,11 +583,28 @@ class GuiHandViewer(QSplitter):
         if getattr(self, "flagBombPot", None) and self.flagBombPot.isChecked():
             extra.append("h.bombPot > 0")
         if getattr(self, "flagDoubleBoard", None) and self.flagDoubleBoard.isChecked():
-            extra.append("(SELECT COUNT(*) FROM Boards b WHERE b.handId = h.id) >= 2")
-        if getattr(self, "flagSplashPot", None) and self.flagSplashPot.isChecked():
-            extra.append("h.splashPot > 0")
+            # In FPDB a true double-board hand is a bomb pot with two stored
+            # boards. A shared-flop run-it-twice also has two Boards rows, but
+            # is deliberately excluded from this filter.
+            extra.append("h.bombPot > 0 AND (SELECT COUNT(*) FROM Boards b WHERE b.handId = h.id) >= 2")
+        splash_condition = self._splash_filter_condition()
+        if splash_condition:
+            extra.append(splash_condition)
+        placeholder = getattr(self.db.sql, "query", {}).get("placeholder", "%s")
+        try:
+            advanced_values = self._advanced_filter_values() if hasattr(self, "_advanced_filter_values") else {}
+        except ValueError as exc:
+            QMessageBox.warning(self, _("Invalid review filter"), str(exc))
+            return []
+        analytics_warning = self._analytics_filter_warning(advanced_values)
+        if analytics_warning:
+            QMessageBox.warning(self, _("Analytics data unavailable"), analytics_warning)
+            return []
+        advanced, advanced_params = build_filter_clauses(advanced_values, placeholder)
+        extra.extend(advanced)
         if extra:
             q = q + " AND " + " AND ".join(extra)
+        q = escape_literal_percent(q, placeholder)
 
         # Diagnostic: log the fully-assembled query and the active filter state so
         # missing-hands issues (e.g. a category excluded by date/game/limit/position)
@@ -286,10 +620,24 @@ class GuiHandViewer(QSplitter):
         )
 
         c = self.db.get_cursor()
-        c.execute(q)
+        if advanced_params:
+            c.execute(q, advanced_params)
+        else:
+            c.execute(q)
         result = [r[0] for r in c.fetchall()]
         log.info("Load Hands matched %d hand(s) for dates %s..%s", len(result), start, end)
         return result
+
+    def _splash_filter_condition(self) -> str | None:
+        """Return the SQL condition for the selected splash-pot mode."""
+        mode = "all"
+        selector = getattr(self, "flagSplashPot", None)
+        if selector is not None and hasattr(selector, "currentData"):
+            mode = selector.currentData() or "all"
+        return {
+            "only": "h.splashPot > 0",
+            "exclude": "(h.splashPot = 0 OR h.splashPot IS NULL)",
+        }.get(mode)
 
     def rankedhand(self, hand, game):
         ranks = {
@@ -394,13 +742,17 @@ class GuiHandViewer(QSplitter):
             hand.calculate_net_collected()
         bet = 0
         if hero in hand.pot.committed:
-            bet = hand.pot.committed[hero] - hand.pot.returned.get(hero, Decimal("0"))
+            # Pot.removeMoney already removes uncalled bets from committed.
+            bet = hand.pot.committed[hero]
         net = hand.net_collected.get(hero, 0)
         pos = hand.get_player_position(hero)
         nbplayers = len(hand.players)
         totalpot = hand.totalpot
         rake = hand.rake if hand.rake is not None else Decimal("0.00")
         sitehandid = hand.handid
+        currency = str(hand.gametype.get("currency", "USD"))
+        splash = getattr(hand, "splashPot", 0) or 0
+        splash_won = (getattr(hand, "splashWinnings", {}) or {}).get(hero, 0) or 0
         base = hand.gametype["base"]
         category = hand.gametype.get("category", "")
 
@@ -409,9 +761,7 @@ class GuiHandViewer(QSplitter):
         if base == "hold":
             holestr = hand.join_holecards(hero)
             single = (
-                list(hand.board.get("FLOP", []))
-                + list(hand.board.get("TURN", []))
-                + list(hand.board.get("RIVER", []))
+                list(hand.board.get("FLOP", [])) + list(hand.board.get("TURN", [])) + list(hand.board.get("RIVER", []))
             )
             runs = []
             for run in (1, 2, 3):
@@ -429,9 +779,7 @@ class GuiHandViewer(QSplitter):
             first_street = hand.actionStreets[1] if len(hand.actionStreets) > 1 else "PREFLOP"
             pre_actions = hand.get_actions_short(hero, first_street)
             later_streets = [s for s in ("FLOP", "TURN", "RIVER") if s != first_street]
-            post_actions = (
-                "" if "F" in pre_actions else hand.get_actions_short_streets(hero, *later_streets)
-            )
+            post_actions = "" if "F" in pre_actions else hand.get_actions_short_streets(hero, *later_streets)
         elif base == "stud":
             holestr = " ".join(hand.holecards["THIRD"][hero][0]) + " " + " ".join(hand.holecards["THIRD"][hero][1])
             later = []
@@ -440,7 +788,9 @@ class GuiHandViewer(QSplitter):
             board_runs = [later] if later else []
             pre_actions = hand.get_actions_short(hero, "THIRD")
             post_actions = (
-                "" if "F" in pre_actions else hand.get_actions_short_streets(hero, "FOURTH", "FIFTH", "SIXTH", "SEVENTH")
+                ""
+                if "F" in pre_actions
+                else hand.get_actions_short_streets(hero, "FOURTH", "FIFTH", "SIXTH", "SEVENTH")
             )
         else:  # draw
             holestr = hand.join_holecards(hero, street="DEAL")
@@ -468,6 +818,7 @@ class GuiHandViewer(QSplitter):
             "Total Pot": format_number(totalpot),
             "Rake": format_number(rake),
             "SiteHandNo": str(sitehandid),
+            "Splash": self._format_splash(splash, splash_won, currency),
         }
 
         ordered = sorted(self.colnum.items(), key=lambda kv: kv[1])
@@ -495,6 +846,11 @@ class GuiHandViewer(QSplitter):
                 try:
                     item.setData(float(values[name]), Qt.ItemDataRole.UserRole)
                 except (TypeError, ValueError):
+                    pass
+            elif name == "Splash":
+                try:
+                    item.setData(float(Decimal(str(splash)) / 100), Qt.ItemDataRole.UserRole)
+                except (TypeError, ValueError, ArithmeticError):
                     pass
             if name in ("Won", "Net"):
                 try:
@@ -545,7 +901,20 @@ class GuiHandViewer(QSplitter):
         "fusion": "Fusion",
     }
     _LIMIT_NAMES = {"nl": "NL", "pl": "PL", "fl": "FL", "cn": "CN", "cp": "CP"}
-    _POSITION_NAMES = {"S": "SB", "B": "BB", "0": "BTN", "1": "CO", "2": "HJ", "3": "LJ", "4": "MP", "5": "MP", "6": "UTG", "7": "UTG"}
+    _POSITION_NAMES = {
+        "S": "SB",
+        "B": "BB",
+        "0": "BTN",
+        "1": "CO",
+        "2": "HJ",
+        "3": "LJ",
+        "4": "MP",
+        "5": "MP",
+        "6": "UTG",
+        "7": "UTG",
+        "8": "Other",
+        "9": "Unknown",
+    }
 
     def _format_game(self, hand) -> str:
         cat = hand.gametype.get("category", "")
@@ -554,6 +923,18 @@ class GuiHandViewer(QSplitter):
 
     def _format_position(self, pos) -> str:
         return self._POSITION_NAMES.get(str(pos), str(pos))
+
+    @staticmethod
+    def _format_splash(splash, splash_won, currency: str) -> str:
+        """Format the room drop and, when present, the hero's collected share."""
+        try:
+            drop_text = format_currency(Decimal(str(splash)) / 100, currency)
+            if splash_won:
+                won_text = format_currency(splash_won, currency)
+                return f"{drop_text} ({won_text} won)"
+            return drop_text
+        except (TypeError, ValueError, ArithmeticError):
+            return ""
 
     def _format_datetime(self, hand) -> str:
         st = getattr(hand, "startTime", None)
@@ -565,13 +946,18 @@ class GuiHandViewer(QSplitter):
             return str(st)
 
     def _hand_flags(self, hand) -> str:
-        flags = []
+        flags: list[str] = []
         try:
             rit = int(hand.runItTimes)
         except (TypeError, ValueError):
             rit = 0
-        if rit >= 2:
+        bomb_pot = bool(getattr(hand, "bombPot", 0))
+        if rit >= 2 and bomb_pot:
+            flags.extend(("BOMB", "2xB"))
+        elif rit >= 2:
             flags.append(f"RIT×{rit}")
+        elif bomb_pot:
+            flags.append("BOMB")
         cashed = bool(getattr(hand, "cashedOut", False))
         allin = False
         for acts in hand.actions.values():
