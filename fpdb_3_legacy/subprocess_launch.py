@@ -40,19 +40,19 @@ def hud_main_command(*args: str) -> list[str]:
     """
     frozen = getattr(sys, "frozen", False)
     if frozen == "pyoxidizer" or (frozen and sys.platform == "darwin"):
-        # Keep the macOS HUD under the main app's code identity. TCC grants
-        # Screen Recording and Accessibility to that identity; a separately
-        # frozen sibling has another designated requirement and loses both
-        # permissions even though it lives inside fpdb.app.
+        # macOS must keep the GUI and HUD under one code identity so TCC grants
+        # (Screen Recording and Accessibility) apply to both processes.
+        # PyOxidizer always uses one launcher; the PyInstaller main executable
+        # embeds the same --hud dispatcher on macOS.
         return [sys.executable, HUD_FLAG, *args]
     if frozen:
         # PyInstaller ships HUD_main as a sibling executable of fpdb.
         name = "HUD_main.exe" if os.name == "nt" else "HUD_main"
-        executable = Path(sys.executable).resolve().parent / name
-        if not executable.is_file():
+        executable = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), name)
+        if not os.path.isfile(executable):
             msg = f"HUD_main not found at {executable}"
             raise FileNotFoundError(msg)
-        return [str(executable), *args]
+        return [executable, *args]
     hud_main = Path(__file__).resolve().parent / "HUD_main.pyw"
     if not hud_main.is_file():
         msg = f"HUD_main not found at {hud_main}"
@@ -106,7 +106,7 @@ def unbuffer_streams() -> None:
     """
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(line_buffering=True)
+            stream.reconfigure(line_buffering=True)  # type: ignore[union-attr]
         except (AttributeError, ValueError):
             # No console at all (windowed build), or an already-closed stream.
             continue

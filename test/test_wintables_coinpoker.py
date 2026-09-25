@@ -6,15 +6,12 @@ sites never finds the table. These tests lock in the special case: broaden the
 search to the client name and keep only the Unity render window.
 """
 
-import os
 import sys
 from unittest.mock import Mock, patch
 
 import pytest
 
 pytestmark = pytest.mark.qt
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Light Qt stubs so WinTables imports without a real display.
 sys.modules.setdefault("PySide6", Mock())
@@ -323,11 +320,17 @@ def test_window_pid_non_windows() -> None:
 
 
 def test_get_geometry_uses_cached_geometry_once() -> None:
+    # Pinned off win32 on purpose: 3 and 29 are the fallback border and caption
+    # this code uses when it cannot ask the window manager. On Windows the real
+    # metrics come from GetSystemMetrics, whose values follow the desktop's
+    # theme and DPI -- asserting them here would test the machine, not the
+    # arithmetic. The win32 branch has its own test, with the metrics mocked.
     t = _make_regular_table()
     t.site = "PokerStars"
     t.number = 42
     t._table_geometry = _GEOM
-    geom = t.get_geometry()
+    with patch("sys.platform", "linux"):
+        geom = t.get_geometry()
     assert geom is not None
     assert geom["x"] == _GEOM.x + 3
     assert geom["y"] == _GEOM.y + 29 + 3
@@ -363,10 +366,13 @@ def test_get_geometry_coinpoker_live() -> None:
     t._detector.find_tables.return_value = _windows((957, "930357"))
     t._detector.is_window_displayed.return_value = True
     t._detector.get_window_geometry.return_value = _GEOM
-    with patch("fpdb.infrastructure.platform.windows_process.table_id_for_pid", return_value="930357"):
+    with (
+        patch("fpdb.infrastructure.platform.windows_process.table_id_for_pid", return_value="930357"),
+        patch("sys.platform", "linux"),  # the fallback border, not this desktop's
+    ):
         geom = t.get_geometry()
     assert geom is not None
-    assert geom["width"] == _GEOM.width - 6
+    assert geom["width"] == _GEOM.width - 2 * 3
 
 
 def test_get_window_title() -> None:
@@ -389,17 +395,69 @@ def test_move_and_resize_window() -> None:
 
 
 def test_topify_reparents() -> None:
+    """QWindow.fromWinId must be patched, not merely stubbed by import order.
+
+    ``t.number`` is a fabricated table id, and ``fromWinId`` takes it as a
+    *native* window handle. The module-level ``sys.modules.setdefault`` stubs
+    above only apply when this file imports PySide6 first, which is not the
+    case under ``-m qt``: pytest-qt has already imported the real Qt, so the
+    real ``fromWinId`` dereferenced 42 as an ``NSView*`` and segfaulted the
+    interpreter on macOS, taking the rest of the Qt suite with it (#258).
+    """
     t = _make_regular_table()
     t.number = 42
     window = Mock()
     handle = Mock()
     window.windowHandle.return_value = handle
-    t.topify(window)
-    handle.setTransientParent.assert_called_once_with(t.gdkhandle)
-    handle.setFlags.assert_called_once()
-    # Second call reuses the cached handle.
-    t.topify(window)
-    assert handle.setTransientParent.call_count == 2
+
+    table_handle = Mock()
+    with patch.object(WinTables, "QWindow") as qwindow_cls:
+        qwindow_cls.fromWinId.return_value = table_handle
+
+        t.topify(window)
+
+        qwindow_cls.fromWinId.assert_called_once_with(42)
+        assert t.gdkhandle is table_handle
+        handle.setTransientParent.assert_called_once_with(table_handle)
+        handle.setFlags.assert_called_once()
+
+        # Second call reuses the cached handle instead of resolving it again.
+        t.topify(window)
+        assert handle.setTransientParent.call_count == 2
+        qwindow_cls.fromWinId.assert_called_once_with(42)
+
+
+def test_topify_gives_up_when_the_table_window_is_gone() -> None:
+    """A table that closed mid-call must not take the HUD down with it.
+
+    ``fromWinId`` returns None for a window id that no longer exists, and the
+    next line called ``setTransientParent`` on it regardless -- and the HUD
+    calls topify exactly when tables are appearing and disappearing.
+    """
+    t = _make_regular_table()
+    t.number = 42
+    window = Mock()
+
+    with patch.object(WinTables, "QWindow") as qwindow_cls:
+        qwindow_cls.fromWinId.return_value = None
+
+        t.topify(window)
+
+        assert t.gdkhandle is None, "un handle non résolu ne doit pas être mis en cache"
+        window.windowHandle.assert_not_called()
+
+
+def test_topify_gives_up_when_the_hud_window_has_no_handle() -> None:
+    """windowHandle() is None until the widget is native; skip rather than crash."""
+    t = _make_regular_table()
+    t.number = 42
+    window = Mock()
+    window.windowHandle.return_value = None
+
+    with patch.object(WinTables, "QWindow") as qwindow_cls:
+        qwindow_cls.fromWinId.return_value = Mock()
+
+        t.topify(window)  # ne doit pas lever
 
 
 def test_check_bad_words_case_insensitive() -> None:

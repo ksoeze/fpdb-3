@@ -7,12 +7,18 @@ it read ``CONFIG_PATH/HUD_config.xml`` directly. It must now resolve the config
 path gracefully and never crash startup.
 """
 
-import os
-import sys
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import pytest
 
-from fpdb_3_legacy import L10n
+from fpdb_3_legacy import L10n, localized_formats
+
+
+@pytest.fixture(autouse=True)
+def restore_format_locale():
+    """Keep locale changes made while testing L10n from leaking to other tests."""
+    previous = localized_formats.get_format_locale()
+    yield
+    localized_formats.set_format_locale(previous)
 
 MINIMAL_CONFIG = '<config><general ui_language="en"></general></config>'
 
@@ -101,6 +107,21 @@ def test_a_missing_ui_language_still_follows_the_environment(tmp_path, monkeypat
     untranslated strings.
     """
     asked = []
+    qlocale = localized_formats.QLocale
+
+    class FrenchSystemLocale:
+        """Make the environment-dependent locale deterministic in this test."""
+
+        Language = qlocale.Language
+
+        def __new__(cls, *args):
+            return qlocale(*args)
+
+        @staticmethod
+        def system():
+            return qlocale("fr_FR")
+
+    monkeypatch.setattr(localized_formats, "QLocale", FrenchSystemLocale)
 
     def fake_translation(_domain, _localedir=None, languages=None, **_kwargs):
         asked.append(languages)
@@ -113,6 +134,7 @@ def test_a_missing_ui_language_still_follows_the_environment(tmp_path, monkeypat
     L10n.set_locale_translation(str(_config_with(tmp_path, 'ui_language="system"')))
 
     assert asked == [None, None]
+    assert localized_formats.get_format_locale() == "fr_FR"
 
 
 if __name__ == "__main__":

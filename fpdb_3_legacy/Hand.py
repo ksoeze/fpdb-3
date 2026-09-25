@@ -477,6 +477,7 @@ class Hand:
         self.hands["fileId"] = fileId
         db.storeHand(self.hands, doinsert, printtest)
         db.storeBoards(self.dbid_hands, self.hands["boards"], doinsert)
+        db.storeBoardFeatures(self.dbid_hands, self.hands["boardfeatures"], doinsert)
 
     def insertHandsPlayers(self, db, doinsert=False, printtest=False) -> None:
         log.info(
@@ -542,6 +543,26 @@ class Hand:
             for hs in self.handsstove:
                 hs[0] = self.dbid_hands
         db.storeHandsStove(self.handsstove, doinsert)
+
+    def insertHandsSituations(self, db, doinsert=False) -> None:
+        """Persist the named decisions of this hand (#294, stored since #305)."""
+        if self.saveActions:
+            db.storeHandsSituations(
+                self.dbid_hands,
+                self.playerIds,
+                self.stats.getSituations(),
+                doinsert,
+            )
+
+    def insertHandStates(self, db, doinsert=False) -> None:
+        """Persist what each postflop decision was holding (#302)."""
+        if self.saveActions:
+            db.storeHandStates(
+                self.dbid_hands,
+                self.playerIds,
+                self.stats.getHandStates(),
+                doinsert,
+            )
 
     def insertHandsShowdown(self, db, doinsert=False) -> None:
         """Persist parsed showdown combinations (and winning cards) per player.
@@ -1442,15 +1463,19 @@ class Hand:
             )
 
     def calculate_net_collected(self) -> None:
-        """Calculate the net collected amount for each player."""
+        """Calculate profit after the amount actually committed by each player.
+
+        ``Pot.removeMoney`` removes uncalled bets from ``pot.committed`` while
+        recording them in ``pot.returned``. Consequently ``committed`` is
+        already the net paid amount and returned money must not be added again.
+        """
         log.debug("Starting net collected calculation...")
 
         self.net_collected = {}
         for player in self.pot.committed:
             collected = self.collectees.get(player, Decimal("0.00"))
-            uncalled_bets = self.pot.returned.get(player, Decimal("0.00"))
             committed = self.pot.committed.get(player, Decimal("0.00"))
-            self.net_collected[player] = collected + uncalled_bets - committed
+            self.net_collected[player] = collected - committed
             log.debug(f"Net collected for {player}: {self.net_collected[player]:.2f}")
 
         log.debug("Net collected calculation complete.")
@@ -3080,7 +3105,7 @@ class Pot:
 
     def removeMoney(self, player, amount) -> None:
         self.committed[player] -= amount
-        self.returned[player] = amount
+        self.returned[player] = self.returned.get(player, Decimal("0.00")) + amount
 
     def setSTP(self, amount) -> None:
         self.stp = amount
