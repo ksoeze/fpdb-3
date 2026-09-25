@@ -46,6 +46,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +100,27 @@ class WinamaxTableUpdate:
         depending on window titles.
         """
         return self.hand_id.split("-")[0] if self.hand_id else ""
+
+    street: str = "preflop"
+    """Current street, from the client's explicit ``round`` event."""
+
+    preflop_raises: int = 0
+    preflop_calls: int = 0
+    preflop_calls_after_raise: int = 0
+    preflop_aggressor: str = ""
+    folded_players: set[str] = field(default_factory=set)
+    table_label: str = ""
+    """Visible cash-table label from the client's ``wam://table`` route."""
+
+    @property
+    def pot_type(self) -> str:
+        if self.preflop_raises >= 3:
+            return "four_bet_plus"
+        if self.preflop_raises == 2:
+            return "three_bet"
+        if self.preflop_raises == 1:
+            return "single_raised"
+        return "limped" if self.preflop_calls else "unopened"
 
 
 def fpdb_hand_id(site_hand_id: str) -> str | None:
@@ -163,6 +185,7 @@ class WinamaxLiveLogReader:
     """
 
     PRIME_BYTES = 400_000
+    ROUTE_PRIME_BYTES = 32_000_000
     """How far back to read when opening a log, to recover recent hand/window pairs.
 
     The client writes a few hundred bytes per hand, so this covers well over an
@@ -183,6 +206,10 @@ class WinamaxLiveLogReader:
     RE_ACTION = re.compile(
         r"\[table\]\s+(?P<tbl_no>\d+)\s+(?P<pool>\S+)\s+action\s+(?P<action_type>\S+)\s+login=\"(?P<login>[^\"]+)\"",
     )
+    RE_ROUND = re.compile(
+        r"\[table\]\s+(?P<tbl_no>\d+)\s+(?P<pool>\S+)\s+round\s+(?P<street>flop|turn|river)\s+board=",
+        re.IGNORECASE,
+    )
     RE_CARDS = re.compile(
         r"\[table\]\s+(?P<tbl_no>\d+)\s+(?P<pool>\S+)\s+cards\s+login=\"(?P<login>[^\"]+)\"",
     )
@@ -190,6 +217,7 @@ class WinamaxLiveLogReader:
     RE_GAIN = re.compile(
         r"\[table\]\s+(?P<tbl_no>\d+)\s+(?P<pool>\S+)\s+gain\s",
     )
+    RE_TABLE_ROUTE = re.compile(r"wam://table(?:-open)?\?[^\s]+")
 
     def __init__(
         self,
@@ -201,6 +229,7 @@ class WinamaxLiveLogReader:
         self._running = False
         self._thread: threading.Thread | None = None
         self._tables: dict[str, WinamaxTableUpdate] = {}
+        self._pool_labels: OrderedDict[str, str] = OrderedDict()
         self._tailing: Path | None = None
         # Site hand id -> client table index, so an imported hand can be traced
         # back to the window it was played on. Bounded: only recent hands can
@@ -233,6 +262,12 @@ class WinamaxLiveLogReader:
 
     def parse_log_line(self, line: str) -> dict[str, Any] | None:
         """Parse a single Winamax log line into an event dict, or None."""
+        if "wam://table" in line and (route := self.RE_TABLE_ROUTE.search(line)):
+            params = parse_qs(urlsplit(route.group()).query)
+            pool = (params.get("tblrk") or [""])[0]
+            label = (params.get("label") or [""])[0]
+            if pool and label:
+                return {"event": "table_label", "pool": pool, "label": label}
         if "[table]" not in line:
             return None
 
@@ -253,6 +288,14 @@ class WinamaxLiveLogReader:
                 "pool": m.group("pool"),
                 "action_type": m.group("action_type"),
                 "login": m.group("login"),
+            }
+
+        if " round " in line and (m := self.RE_ROUND.search(line)):
+            return {
+                "event": "round",
+                "table_no": m.group("tbl_no"),
+                "pool": m.group("pool"),
+                "street": m.group("street").lower(),
             }
 
         if " gain " in line and (m := self.RE_GAIN.search(line)):
@@ -282,15 +325,30 @@ class WinamaxLiveLogReader:
         the end of the log recovers the pairings; the callback stays silent so
         no long-finished table is ever reported as current.
         """
+        # Counted outside the try: a seek that fails on a locked or truncated
+        # file used to leave this unbound, and the report below then raised
+        # UnboundLocalError over the handled error -- which the watch loop
+        # caught as a read failure, closed the file, and retried, so priming
+        # could never succeed on such a log.
+        lines = 0
         try:
             file_obj.seek(0, os.SEEK_END)
             size = file_obj.tell()
+            self._priming = True
+            # A classic table's visible label is usually logged only when the
+            # window opens. It can be older than the recent hand tail; recover
+            # routes separately without replaying millions of old actions.
+            route_start = max(0, size - self.ROUTE_PRIME_BYTES)
+            file_obj.seek(route_start)
+            if route_start:
+                file_obj.readline()
+            for line in file_obj:
+                if "wam://table" in line:
+                    self.process_line(line)
+
             file_obj.seek(max(0, size - self.PRIME_BYTES))
             if size > self.PRIME_BYTES:
                 file_obj.readline()  # discard a line the seek cut in half
-
-            self._priming = True
-            lines = 0
             for line in file_obj:
                 self.process_line(line)
                 lines += 1
@@ -332,6 +390,7 @@ class WinamaxLiveLogReader:
             hand_id=hand_id,
             hero=None,
             logged_at_ms=logged_at_ms,
+            table_label=self._pool_labels.get(pool, ""),
         )
         self._tables[pool] = table
         # Indexed under both the log's own id and the one fpdb stores for it, so
@@ -343,7 +402,7 @@ class WinamaxLiveLogReader:
             self._hand_tables.popitem(last=False)
         return table
 
-    def process_line(self, line: str) -> None:
+    def process_line(self, line: str, notify: bool = True) -> None:
         """Update table state from one log line and notify on change."""
         parsed = self.parse_log_line(line)
         if not parsed:
@@ -351,6 +410,15 @@ class WinamaxLiveLogReader:
 
         pool = parsed["pool"]
         event = parsed["event"]
+
+        if event == "table_label":
+            self._pool_labels[pool] = parsed["label"]
+            self._pool_labels.move_to_end(pool)
+            while len(self._pool_labels) > self.HAND_TABLE_HISTORY:
+                self._pool_labels.popitem(last=False)
+            if pool in self._tables:
+                self._tables[pool].table_label = parsed["label"]
+            return
 
         if event == "hand_start":
             table = self._start_hand(
@@ -362,7 +430,10 @@ class WinamaxLiveLogReader:
             # Reported straight away, with an empty ring: on a Fast-Fold table
             # the hero has just been moved somewhere new, and everyone the HUD is
             # still showing has been left behind.
-            self._notify(table)
+            if notify:
+                self._notify(table)
+            else:
+                self._mark_pending(table)
             return
 
         table = self._tables.get(pool)
@@ -372,6 +443,23 @@ class WinamaxLiveLogReader:
             return
 
         if self._apply_event(table, event, parsed):
+            if notify:
+                self._notify(table)
+            else:
+                self._mark_pending(table)
+
+    def _mark_pending(self, table: WinamaxTableUpdate) -> None:
+        if not hasattr(self, "_pending_updates"):
+            self._pending_updates = {}
+        self._pending_updates[table.pool] = table
+
+    def _flush_pending(self) -> None:
+        pending = getattr(self, "_pending_updates", None)
+        if not pending:
+            return
+        to_notify = list(pending.values())
+        pending.clear()
+        for table in to_notify:
             self._notify(table)
 
     @staticmethod
@@ -390,16 +478,41 @@ class WinamaxLiveLogReader:
                 changed = True
 
         elif event == "action":
-            login = parsed["login"]
-            if login not in table.ring:
-                table.ring.append(login)
-                changed = True
-            # A fold by the hero ends this table for them: the client moves them
-            # on immediately, so the overlay should stop describing it.
-            if login == table.hero and "fold" in parsed["action_type"].lower() and not table.hero_left:
-                table.hero_left = True
+            changed = WinamaxLiveLogReader._apply_action(table, parsed)
+
+        elif event == "round":
+            if table.street != parsed["street"]:
+                table.street = parsed["street"]
                 changed = True
 
+        return changed
+
+    @staticmethod
+    def _apply_action(table: WinamaxTableUpdate, parsed: dict[str, Any]) -> bool:
+        login = parsed["login"]
+        action_type = parsed["action_type"].lower()
+        changed = False
+        if table.street == "preflop":
+            if action_type == "raise":
+                table.preflop_raises += 1
+                table.preflop_calls_after_raise = 0
+                table.preflop_aggressor = login
+                changed = True
+            elif action_type == "call":
+                table.preflop_calls += 1
+                if table.preflop_raises:
+                    table.preflop_calls_after_raise += 1
+                changed = True
+        if login not in table.ring:
+            table.ring.append(login)
+            changed = True
+        if login == table.hero and "fold" in action_type and not table.hero_left:
+            table.hero_left = True
+            changed = True
+        if "fold" in action_type:
+            if login not in table.folded_players:
+                table.folded_players.add(login)
+                changed = True
         return changed
 
     def start(self) -> None:
@@ -421,7 +534,7 @@ class WinamaxLiveLogReader:
         if thread and thread.is_alive():
             thread.join(timeout=2.0)
 
-    def _watch_loop(self) -> None:
+    def _watch_loop(self) -> None:  # noqa: C901
         """Tail the newest Winamax log file, following rotation."""
         file_obj = None
         current_path: Path | None = None
@@ -442,8 +555,12 @@ class WinamaxLiveLogReader:
                         self._tailing = latest
 
                     if file_obj:
+                        has_lines = False
                         while line := file_obj.readline():
-                            self.process_line(line)
+                            self.process_line(line, notify=False)
+                            has_lines = True
+                        if has_lines:
+                            self._flush_pending()
 
                 except Exception:
                     log.exception("Error reading Winamax live log:")

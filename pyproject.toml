@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fpdb-3"
-version = "3.6.1"
+version = "3.9.1"
 description = "Free Poker Database (FPDB-3) - Legacy Python Implementation"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -12,10 +12,13 @@ license-files = ["LICENSE"]
 requires-python = ">=3.11,<4.0"
 dependencies = [
     "beautifulsoup4==4.12.3",
-    "matplotlib>=3.10.7",
     "pandas>=2.2.2",
     "psutil>=5.9.0",
     "pyobjc==10.3.1; sys_platform == 'darwin'",
+    # UIAutomation, the Windows half of reading a table's chairs off the client
+    # window. Without it the Fast-Fold HUD can only learn who is at the table
+    # from the client log, one player per action; see winamax_ax_seats.
+    "comtypes>=1.4.1; sys_platform == 'win32'",
     "PySide6>=6.8.1",
     "colorlog==6.9.0",
     "pyzmq>=26.0.3",
@@ -24,11 +27,11 @@ dependencies = [
     "pytz==2024.1",
     "aiohttp>=3.13.2",
     "cachetools==5.5.0",
-    "mplfinance>=0.12.10b0",
     "xlrd==2.0.1",
     "playwright>=1.40.0",
     "pymysql>=1.1.0",
     "defusedxml>=0.7.1",
+    "pyqtgraph>=0.13.0",
     # PostgreSQL is offered in the GUI's database chooser, so the driver has to
     # ship with the application. Left as an extra, a packaged build could only
     # ever open SQLite or MySQL.
@@ -40,6 +43,11 @@ dependencies = [
 build = [
     "pyinstaller>=6.9.0",
     "wheel>=0.42.0",
+    # PyInstaller converts the .jpg application icon to .ico for the Windows
+    # executable, and needs Pillow to do it. Pillow used to arrive transitively
+    # through matplotlib; dropping that dependency broke the Windows build, so
+    # the build-time requirement is now declared where it belongs.
+    "pillow>=10.0.0",
 ]
 test = [
     "pytest>=8.3.2",
@@ -62,7 +70,7 @@ test-no-gui = [
     "ruff>=0.12.8",
     "mypy>=1.11",
 ]
-windows = ["pywin32==306", "configparser", "PySide6>=6.8.1"]
+windows = ["pywin32==306", "configparser", "PySide6>=6.8.1", "comtypes>=1.4.1"]
 linux = ["xcffib==1.5.0", "PySide6>=6.8.1"]
 macos = ["PySide6>=6.8.1"]
 postgresql = ["psycopg[binary]>=3.1.0"]
@@ -70,6 +78,19 @@ mysql = ["mysqlclient==2.2.4"]
 
 [project.scripts]
 fpdb_3_legacy = "fpdb_3_legacy.legacy_launcher:main"
+
+# uv is pinned exactly, and every setup-uv step in .github/workflows/ci.yml is
+# pinned to the same version, because uv.lock is versioned on purpose (see
+# .gitattributes) and the marker layout inside it is a function of the resolver
+# that wrote it. Two machines on different uv releases would otherwise trade
+# churn in a 4 700-line generated file back and forth, and bury the one
+# meaningful line of a real dependency change under a full re-resolution.
+#
+# This is enforced at runtime: any other uv fails every uv command run against
+# this project, rather than quietly re-resolving. Bump it and the workflow's
+# six version inputs together.
+[tool.uv]
+required-version = "==0.12.7"
 
 [tool.ruff]
 extend-include = ["*.pyw"]
@@ -246,6 +267,23 @@ reportMissingImports = false
 where = ["."]
 include = ["fpdb_3_legacy", "fpdb_3_legacy.*", "fpdb", "fpdb.*"]
 
+[tool.setuptools.package-data]
+# The bundled declarative libraries are data, not modules, and an installed
+# package without them is quietly broken: an empty stat registry, dynamic
+# panel rules that resolve to nothing, no popup packs, no shipped presets.
+# Every ``*.d`` directory under the package has to be listed here -- PyOxidizer
+# globs the extensions it allows and PyInstaller copies the directory whole,
+# but setuptools installs modules only.
+fpdb_3_legacy = [
+    "analytics_cohorts.d/*.json",
+    "analytics_definitions.d/*.json",
+    "hud_situation.d/*.json",
+    "popup_packs.d/*.json",
+    "research_presets.d/*.json",
+    "research_studies.d/*.json",
+    "stats.d/*.toml",
+]
+
 [tool.coverage.run]
 source = ["fpdb_3_legacy", "fpdb"]
 branch = true
@@ -261,7 +299,7 @@ omit = [
 [tool.briefcase]
 project_name = "Free Poker Database 3"
 bundle = "org.fpdb"
-version = "3.6.1"
+version = "3.9.1"
 
 [tool.briefcase.app.fpdb]
 formal_name = "FPDB"
@@ -269,7 +307,6 @@ description = "Free Poker Database 3 - Legacy Edition"
 sources = ["fpdb_3_legacy", "fpdb", ".briefcase-resources"]
 requires = [
     "PySide6>=6.8.1",
-    "matplotlib>=3.10.7",
     "pandas>=2.2.2",
     "psutil>=5.9.0",
     "colorlog==6.9.0",
@@ -279,7 +316,6 @@ requires = [
     "pytz==2024.1",
     "aiohttp>=3.13.2",
     "cachetools==5.5.0",
-    "mplfinance>=0.12.10b0",
     "xlrd==2.0.1",
     "playwright>=1.40.0",
     "defusedxml>=0.7.1",
@@ -290,7 +326,8 @@ requires = [
     # Likewise for PostgreSQL.
     "psycopg[binary]>=3.1.0",
     # Native equity backend used by the equity calculator and AoF tools.
-    "pypoker-eval @ git+https://github.com/jejellyroll-fr/poker-eval.git@v1.2.0"
+    "pypoker-eval @ git+https://github.com/jejellyroll-fr/poker-eval.git@v1.2.0",
+    "pyqtgraph>=0.13.0",
 ]
 
 [tool.briefcase.app.fpdb.macOS]
@@ -308,8 +345,14 @@ requires = [
 ]
 
 [tool.briefcase.app.fpdb.windows]
+# comtypes is how the HUD reads a table's chairs through UIAutomation. It is
+# imported inside the function that uses it and the ImportError is swallowed
+# into "no reader on this machine", so a package missing it does not fail
+# loudly -- the Fast-Fold HUD just falls back to the client log and shows its
+# stat blocks one player at a time.
 requires = [
-    "pywin32==306"
+    "pywin32==306",
+    "comtypes>=1.4.1"
 ]
 
 [tool.briefcase.app.fpdb.linux]
