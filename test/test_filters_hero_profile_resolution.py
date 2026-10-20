@@ -53,6 +53,10 @@ class _Db:
     def get_hero_player_ids(self, _site=None, profile=None):  # noqa: ARG002
         return list(self.hero_flagged)
 
+    def get_selected_player_ids(self, site, name):
+        result = self.get_player_id(None, site, name)
+        return [result] if result is not None else self.get_hero_player_ids(site)
+
     def get_player_name_by_id(self, pid):
         for name, (player_id, _site_id) in self.players.items():
             if player_id == pid:

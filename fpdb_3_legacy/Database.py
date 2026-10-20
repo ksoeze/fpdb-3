@@ -40,8 +40,7 @@ import pytz
 from cachetools import TTLCache
 
 from fpdb_3_legacy import SQL, Card, Configuration, db_profile
-from fpdb_3_legacy.action_enum_stats import CACHE_KEYS as ACTION_ENUM_CACHE_KEYS
-from fpdb_3_legacy.action_enum_stats import SITUATIONS as ACTION_ENUM_SITUATIONS
+from fpdb_3_legacy.cache_rebuild import rebuild_stat_columns
 from fpdb_3_legacy.database_aof import DatabaseAofMixin
 from fpdb_3_legacy.database_auto_notes import DatabaseAutoNotesMixin
 from fpdb_3_legacy.database_bulk_import import DatabaseBulkImportMixin
@@ -51,7 +50,7 @@ from fpdb_3_legacy.database_bulk_import import DatabaseBulkImportMixin
 # them from Database. The redundant alias marks the re-export for the linters.
 from fpdb_3_legacy.database_caches import CACHE_KEYS as CACHE_KEYS
 from fpdb_3_legacy.database_caches import HUDCACHE_EXTRA_KEYS as HUDCACHE_EXTRA_KEYS
-from fpdb_3_legacy.database_caches import DatabaseCachesMixin
+from fpdb_3_legacy.database_caches import SESSION_CACHE_KEYS, DatabaseCachesMixin
 from fpdb_3_legacy.database_hud_stats import DatabaseHudStatsMixin
 from fpdb_3_legacy.database_lambda_dict import LambdaDict
 from fpdb_3_legacy.database_players import DatabasePlayersMixin
@@ -96,6 +95,12 @@ re_char = re.compile("[^a-zA-Z]")
 # from a stale entry; the size bounds a long multi-tabling session.
 GAMEINFO_CACHE_SIZE = 2000
 GAMEINFO_CACHE_TTL = 3600
+
+# Every SQLite connection runs in WAL mode. With synchronous=OFF a crash of the
+# operating system or a power cut can corrupt the database file, not only lose
+# the last transactions; in WAL mode NORMAL is corruption-safe and still skips
+# the fsync on each commit (it syncs at checkpoints), so imports stay fast (#436).
+SQLITE_SYNCHRONOUS_PRAGMA = "PRAGMA synchronous=NORMAL"
 
 #    FreePokerTools modules
 
@@ -158,8 +163,32 @@ def convert_decimal(s):
     return Decimal(s)
 
 
+def _mysql_connection_kwargs(host, port, user, password, database) -> dict[str, Any]:
+    """What both MySQL connection paths pass to the driver.
+
+    ``utf8mb4`` is not a preference. ``Players.name`` holds supplementary characters as
+    ``utf8mb4`` since #417, and MySQL's ``utf8`` client character set is three bytes wide: with
+    it, a hand naming ``Alice😀`` is refused by the server (``incorrect string value``) before
+    the name reaches a column that can hold it. One helper rather than the same dict twice, so
+    a character set fix cannot reach one connection path and miss the other.
+    """
+    kwargs: dict[str, Any] = {
+        "host": host,
+        "user": user,
+        "passwd": password,
+        "db": database,
+        "charset": "utf8mb4",
+        "use_unicode": True,
+        **MYSQL_NETWORK_KWARGS,
+    }
+    if port:
+        kwargs["port"] = int(port)
+    return kwargs
+
+
 # These are for appendStats. Insert new stats at the right place, because
 # SQL needs strict order.
+
 
 class DatabaseTransaction:
     """Context manager for grouping database operations into a single transaction.
@@ -396,12 +425,7 @@ class Database(
             # ISOLATION_LEVEL_READ_COMMITTED = 1
             # ISOLATION_LEVEL_SERIALIZABLE   = 2
 
-        if (
-            self.backend == self.SQLITE
-            and self.database == ":memory:"
-            and self.wrongDbVersion
-            and self.is_connected()
-        ):
+        if self.backend == self.SQLITE and self.database == ":memory:" and self.wrongDbVersion and self.is_connected():
             log.info("sqlite/:memory: - creating")
             self.recreate_tables()
             self.wrongDbVersion = False
@@ -584,17 +608,7 @@ class Database(
         # Note: SQLAlchemy 2.0 removed pool.manage
         # MySQLdb has its own connection pooling, so we don't need it
         try:
-            kwargs = {
-                "host": host,
-                "user": user,
-                "passwd": password,
-                "db": database,
-                "charset": "utf8",
-                "use_unicode": True,
-                **MYSQL_NETWORK_KWARGS,
-            }
-            if port:
-                kwargs["port"] = int(port)
+            kwargs = _mysql_connection_kwargs(host, port, user, password, database)
 
             self.connection = MySQLdb.connect(**kwargs)
             self.__connected = True
@@ -650,7 +664,9 @@ class Database(
                     **PG_NETWORK_KWARGS,
                 )
                 self.__connected = True
-            except Exception as ex:  # intentional broad catch: psycopg connection error inspected and re-raised as a typed FpdbError
+            except (
+                Exception
+            ) as ex:  # intentional broad catch: psycopg connection error inspected and re-raised as a typed FpdbError
                 if "Connection refused" in ex.args[0] or (
                     'database "' in ex.args[0] and '" does not exist' in ex.args[0]
                 ):
@@ -716,8 +732,8 @@ class Database(
                 "PRAGMA journal_mode=WAL",
             )  # use memory for temp tables/indexes
             self.cursor.execute(
-                "PRAGMA synchronous=0",
-            )  # don't wait for file writes to finish
+                SQLITE_SYNCHRONOUS_PRAGMA,
+            )  # crash-safe in WAL mode, see SQLITE_SYNCHRONOUS_PRAGMA
             self.cursor.execute(
                 "PRAGMA busy_timeout=60000",
             )  # wait up to 60 seconds for locks
@@ -727,6 +743,7 @@ class Database(
         else:
             raise FpdbError("sqlite database " + database + " does not exist")
         return database, create
+
     def get_sites(self) -> None:
         self.cursor.execute("SELECT name,id FROM Sites")
         db_sites = dict(self.cursor.fetchall())
@@ -787,7 +804,13 @@ class Database(
             self.connection.commit()
         else:
             # sqlite commits can fail because of shared locks on the database (SQLITE_BUSY)
-            # re-try commit if it fails in case this happened
+            # re-try commit if it fails in case this happened. Only a lock is worth the
+            # wait: a closed or missing connection, a full disk or an I/O error fails the
+            # same way every time, and each pause blocks the caller -- the Qt main thread
+            # for the Session Guard (#428). Extended codes (SQLITE_BUSY_SNAPSHOT, ...)
+            # carry their primary code in the low byte.
+            import sqlite3
+
             maxtimes = 5
             pause = 1
             ok = False
@@ -796,9 +819,16 @@ class Database(
                     self.connection.commit()
                     # log.debug(("commit finished ok, i = ")+str(i))
                     ok = True
-                except Exception as e:  # intentional broad catch: sqlite commit retried on transient SQLITE_BUSY lock
+                except sqlite3.OperationalError as e:
+                    primary = (getattr(e, "sqlite_errorcode", None) or 0) & 0xFF
+                    if primary not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                        log.exception(f"commit {i} failed, not retried: info={sys.exc_info()}, value={e}")
+                        break
                     log.exception(f"commit {i} failed: info={sys.exc_info()}, value={e}")
                     sleep(pause)
+                except Exception as e:  # intentional broad catch: reported as the FpdbError below
+                    log.exception(f"commit {i} failed, not retried: info={sys.exc_info()}, value={e}")
+                    break
                 if ok:
                     break
             if not ok:
@@ -962,7 +992,7 @@ class Database(
         )
         conn.execute("PRAGMA busy_timeout=60000")
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=0")
+        conn.execute(SQLITE_SYNCHRONOUS_PRAGMA)
         conn.create_function("floor", 1, math.floor)
         conn.create_function("sqrt", 1, math.sqrt)
         tmp = sqlitemath()
@@ -1001,18 +1031,9 @@ class Database(
             pymysql.install_as_MySQLdb()
             import MySQLdb
 
-        kwargs = {
-            "host": self.host,
-            "user": self.user,
-            "passwd": self.password,
-            "db": self.database,
-            "charset": "utf8",
-            "use_unicode": True,
-            **MYSQL_NETWORK_KWARGS,
-        }
-        if self.port:
-            kwargs["port"] = int(self.port)
-        return MySQLdb.connect(**kwargs)
+        return MySQLdb.connect(
+            **_mysql_connection_kwargs(self.host, self.port, self.user, self.password, self.database)
+        )
 
     def close_connection(self) -> None:
         if getattr(self, "connection", None):
@@ -1428,8 +1449,6 @@ class Database(
             self._rollback_after_failed_read()
         return positions
 
-
-
     @reconnect_on_connection_loss
     def get_common_cards(self, hand):
         """Get and return the community cards for the specified hand."""
@@ -1462,21 +1481,16 @@ class Database(
     def set_printdata(self, val) -> None:
         self.printdata = val
 
-
-
     # is get_stats_from_hand slow?
     # Gimick - yes  - reason being that the gametypeid join on hands
     # increases exec time on SQLite and postgres by a factor of 6 to 10
     # method below changed to lookup hand.gametypeid and pass that as
     # a constant to the underlying query.
 
-
     # uses query on handsplayers instead of hudcache to get stats on just this session
 
-        # print "session stat_dict =", stat_dict
-        # return stat_dict
-
-
+    # print "session stat_dict =", stat_dict
+    # return stat_dict
 
     def get_site_id(self, site):
         c = self.get_cursor()
@@ -1569,9 +1583,6 @@ class Database(
             raise
         return ret
 
-
-
-
     @staticmethod
     def _apply_tourney_clauses(query, type):
         """Fill the three tourney placeholders, or blank them for ring games."""
@@ -1584,26 +1595,6 @@ class Database(
             query = query.replace("<tourney_select_clause>", "")
             query = query.replace("<tourney_group_clause>", "")
         return query
-
-    @staticmethod
-    def _statscache_action_enum_columns(query):
-        """Rebuild the HudCache action-enum counters from the stored enum chars.
-
-        The counters are summed at import, so a rebuild that did not name them
-        would refill HudCache with zeros and drop whatever had accumulated.
-        HandsPlayers keeps the response char per hand, which is enough to count
-        them again from scratch.
-        """
-        insert_columns = "".join(f"\n            ,{key}" for key in ACTION_ENUM_CACHE_KEYS)
-        select_columns = "".join(
-            f"\n                  ,sum(CASE WHEN hp.{situation.enum_key} {test} THEN 1 ELSE 0 END)"
-            for situation in ACTION_ENUM_SITUATIONS
-            for test in ("<> 'N'", "= 'C'", "= 'R'")
-        )
-        return query.replace("<extra_insert_columns>", insert_columns).replace(
-            "<extra_select_columns>",
-            select_columns,
-        )
 
     def _statscache_hudcache(self, query, type):
         """Fill the rebuild template for HudCache, whose key carries the position."""
@@ -1633,7 +1624,6 @@ class Database(
         query = query.replace("<select>", select)
         query = query.replace("<group>", group)
         query = query.replace("<sessions_join_clause>", "")
-        query = self._statscache_action_enum_columns(query)
 
         if self.build_full_hudcache:
             query = query.replace(
@@ -1653,33 +1643,21 @@ class Database(
                         else 'E'
                    end                                            as hc_position""",
             )
+            # The day of the hand as storeHudCache takes it: its UTC start
+            # time moved back by the same offset, in whole minutes.
+            minutes = round(self.hud_day_offset().total_seconds() / 60)
             if self.backend == self.PGSQL:
-                query = query.replace(
-                    "<styleKey>",
-                    ",'d' || to_char(h.startTime, 'YYMMDD')",
-                )
-                query = query.replace(
-                    "<styleKeyGroup>",
-                    ",to_char(h.startTime, 'YYMMDD')",
-                )
+                day = "to_char(h.startTime - INTERVAL '" + str(minutes) + " minutes', 'YYMMDD')"
+                query = query.replace("<styleKey>", ",'d' || " + day)
+                query = query.replace("<styleKeyGroup>", "," + day)
             elif self.backend == self.SQLITE:
-                query = query.replace(
-                    "<styleKey>",
-                    ",'d' || substr(strftime('%Y%m%d', h.startTime),3,7)",
-                )
-                query = query.replace(
-                    "<styleKeyGroup>",
-                    ",substr(strftime('%Y%m%d', h.startTime),3,7)",
-                )
+                day = "substr(strftime('%Y%m%d', h.startTime, '" + f"{-minutes:+d}" + " minutes'),3,7)"
+                query = query.replace("<styleKey>", ",'d' || " + day)
+                query = query.replace("<styleKeyGroup>", "," + day)
             elif self.backend == self.MYSQL_INNODB:
-                query = query.replace(
-                    "<styleKey>",
-                    ",date_format(h.startTime, 'd%y%m%d')",
-                )
-                query = query.replace(
-                    "<styleKeyGroup>",
-                    ",date_format(h.startTime, 'd%y%m%d')",
-                )
+                day = "date_format(h.startTime - INTERVAL " + str(minutes) + " MINUTE, 'd%y%m%d')"
+                query = query.replace("<styleKey>", "," + day)
+                query = query.replace("<styleKeyGroup>", "," + day)
         else:
             query = query.replace(
                 "<hc_position>",
@@ -1796,9 +1774,14 @@ class Database(
             query = self._statscache_cardscache(query, type)
         elif table == "PositionsCache":
             query = self._statscache_positionscache(query, type)
-        # The action-enum counters are HudCache-only, so every other cache
-        # drops their placeholders rather than inheriting columns it lacks.
-        return query.replace("<extra_insert_columns>", "").replace("<extra_select_columns>", "")
+        # The same keys the import writes into each table (#591): HudCache
+        # carries the HUD-only counters on top of the shared statistics.
+        if "<stat_insert_columns>" not in query:
+            return query
+        keys = [*CACHE_KEYS, *HUDCACHE_EXTRA_KEYS] if table == "HudCache" else SESSION_CACHE_KEYS
+        server = {self.MYSQL_INNODB: "mysql", self.PGSQL: "postgresql", self.SQLITE: "sqlite"}[self.backend]
+        insert_columns, select_columns = rebuild_stat_columns(server, keys)
+        return query.replace("<stat_insert_columns>", insert_columns).replace("<stat_select_columns>", select_columns)
 
     def _rebuild_prepare_heroes(self, h_start, v_start):
         """Resolve the owner's player ids and the two rebuild start dates."""
@@ -1829,7 +1812,14 @@ class Database(
                 v_start = self.villain_hudstart_def
         return h_start, v_start
 
-    def _rebuild_ring_cache(self, table, h_start, v_start, wmid) -> None:
+    def rebuild_sql(self, game_type: str, table: str, where: str) -> str:
+        """The INSERT ... SELECT that refills one half ("ring" or "tour") of a statistics cache."""
+        query = self.sql.query["rebuildCache"].replace("%s", self.sql.query["placeholder"])
+        tourney_join = "INNER JOIN Tourneys t ON (t.id = h.tourneyId)" if game_type == "tour" else ""
+        query = query.replace("<tourney_join_clause>", tourney_join).replace("<where_clause>", where)
+        return self.replace_statscache(game_type, table, query)
+
+    def _rebuild_ring_cache(self, table, h_start, v_start, wmid, commit: bool = True) -> None:
         """Rebuild the cash half of a statistics cache."""
         if self.hero_ids is None:
             if wmid:
@@ -1850,19 +1840,12 @@ class Database(
                 + "'))"
                 + "   AND hp.tourneysPlayersId IS NULL)"
             )
-        rebuild_sql_cash = self.sql.query["rebuildCache"].replace(
-            "%s",
-            self.sql.query["placeholder"],
-        )
-        rebuild_sql_cash = rebuild_sql_cash.replace("<tourney_join_clause>", "")
-        rebuild_sql_cash = rebuild_sql_cash.replace("<where_clause>", where)
-        rebuild_sql_cash = self.replace_statscache("ring", table, rebuild_sql_cash)
-        # print rebuild_sql_cash
-        self.get_cursor().execute(rebuild_sql_cash)
-        self.commit()
+        self.get_cursor().execute(self.rebuild_sql("ring", table, where))
+        if commit:
+            self.commit()
         # print ("Rebuild cache(cash) took %.1f seconds") % (time() - stime,)
 
-    def _rebuild_tourney_cache(self, table, h_start, v_start, ttid, wmid) -> None:
+    def _rebuild_tourney_cache(self, table, h_start, v_start, ttid, wmid, commit: bool = True) -> None:
         """Rebuild the tournament half of a statistics cache."""
         if ttid:
             where = f"WHERE t.tourneyTypeId = {ttid}<hero_where>"
@@ -1885,23 +1868,9 @@ class Database(
                 + "'))"
                 + "   AND hp.tourneysPlayersId >= 0)"
             )
-        rebuild_sql_tourney = self.sql.query["rebuildCache"].replace(
-            "%s",
-            self.sql.query["placeholder"],
-        )
-        rebuild_sql_tourney = rebuild_sql_tourney.replace(
-            "<tourney_join_clause>",
-            """INNER JOIN Tourneys t ON (t.id = h.tourneyId)""",
-        )
-        rebuild_sql_tourney = rebuild_sql_tourney.replace("<where_clause>", where)
-        rebuild_sql_tourney = self.replace_statscache(
-            "tour",
-            table,
-            rebuild_sql_tourney,
-        )
-        # print rebuild_sql_tourney
-        self.get_cursor().execute(rebuild_sql_tourney)
-        self.commit()
+        self.get_cursor().execute(self.rebuild_sql("tour", table, where))
+        if commit:
+            self.commit()
         # print ("Rebuild hudcache took %.1f seconds") % (time() - stime,)
 
     def rebuild_cache(
@@ -1911,18 +1880,25 @@ class Database(
         table="HudCache",
         ttid=None,
         wmid=None,
+        commit: bool = True,
     ) -> None:
-        """Clears hudcache and rebuilds from the individual handsplayers records."""
+        """Clears hudcache and rebuilds from the individual handsplayers records.
+
+        With ``commit=False`` nothing is committed: the clear and both inserts
+        stay in the caller's transaction, which a maintenance tool commits or
+        rolls back together with its own changes.
+        """
         h_start, v_start = self._rebuild_prepare_heroes(h_start, v_start)
 
         if not ttid and not wmid:
             self.get_cursor().execute(self.sql.query[f"clear{table}"])
-            self.commit()
+            if commit:
+                self.commit()
 
         if not ttid:
-            self._rebuild_ring_cache(table, h_start, v_start, wmid)
+            self._rebuild_ring_cache(table, h_start, v_start, wmid, commit)
 
-        self._rebuild_tourney_cache(table, h_start, v_start, ttid, wmid)
+        self._rebuild_tourney_cache(table, h_start, v_start, ttid, wmid, commit)
 
     # end def rebuild_cache
 
@@ -1971,7 +1947,6 @@ class Database(
                 self.wmnew.add((wid, mid))
         self.commit()
         self.cleanUpWeeksMonths()
-
 
     def analyzeDB(self) -> None:
         """Do whatever the DB can offer to update index/table statistics."""
@@ -2052,10 +2027,6 @@ class Database(
 
     # end def lock_for_insert
 
-
-
-
-
     def updateTourneysSessions(self) -> None:
         if self.tbulk:
             q_update_sessions = self.sql.query["updateTourneysSessions"].replace(
@@ -2066,11 +2037,6 @@ class Database(
             for t, sid in list(self.tbulk.items()):
                 c.execute(q_update_sessions, (sid, t))
                 self.commit()
-
-
-
-
-
 
     def get_hands_showdown(self, hand_id) -> dict:
         """Return {player_name: (combo, cards)} for a hand, or {} if none/absent.
@@ -2086,7 +2052,6 @@ class Database(
         except Exception:  # noqa: BLE001 - missing table / legacy DB: no showdown info.
             return {}
         return result
-
 
     def get_hands_cashout(self, hand_id) -> dict:
         """Return {player_name: (amount, fee)} for a hand, or {} if none/absent."""
@@ -2123,7 +2088,6 @@ class Database(
             return 0
         return id[0]
 
-
     def repair_sequence(self, table: str) -> None:
         """Synchronize a backend identity sequence with the stored row ids."""
         from fpdb_3_legacy import dialects
@@ -2141,8 +2105,6 @@ class Database(
         q = q.replace("%s", self.sql.query["placeholder"])
         c = self.get_cursor()
         c.execute(q, fdata)
-
-
 
     def fetchallDict(self, cursor, desc):
         data = cursor.fetchall()
@@ -2190,8 +2152,6 @@ class Database(
             return True
         self.siteHandNos.append(key)
         return False
-
-
 
     def insertOrUpdate(self, type, cursor, key, select, insert):
         if type == "players":

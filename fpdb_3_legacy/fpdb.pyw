@@ -488,6 +488,12 @@ class fpdb(QMainWindow):
         lines.append("\nAssign the new stat-set / popup to a game in HUD Preferences.")
         QMessageBox.information(self, _("PT4 HUD imported"), "\n".join(lines))
 
+    def dia_stat_packs(self, widget=None, data=None) -> None:
+        """Manage user-installed declarative stat packs (#403)."""
+        from fpdb_3_legacy.stat_packs_dialog import open_stat_packs
+
+        open_stat_packs(self)
+
     def dia_import_pt4stat(self, widget, data=None) -> None:
         """Import PokerTracker 4 .pt4stat custom-statistic definitions.
 
@@ -1173,6 +1179,35 @@ class fpdb(QMainWindow):
         # Dialog handles saving and reloading itself
         dia.exec()
 
+    def dia_session_guard(self, widget=None, data=None) -> None:
+        """Open the Session Guard (#395): limits for the session being played."""
+        from fpdb_3_legacy.session_guard_dialog import (
+            SessionGuardAlert,
+            SessionGuardDialog,
+            SessionGuardIndicator,
+            SessionGuardMonitor,
+        )
+
+        if getattr(self, "session_guard", None) is None:
+            # One monitor for the window's lifetime: it keeps running with the dialog closed,
+            # and reads through the window's current connection and configuration so a
+            # configuration reload is followed.
+            self.session_guard = SessionGuardMonitor(lambda: self.db, lambda: self.config, self)
+            self.session_guard_alert = SessionGuardAlert(self.session_guard, self)
+            self.session_guard.alerts.connect(lambda _fired: self.session_guard_alert.show_pending())
+            self.session_guard_indicator = SessionGuardIndicator(self.session_guard, self.dia_session_guard, self)
+            self.statusBar().addPermanentWidget(self.session_guard_indicator)
+        dialog = getattr(self, "session_guard_dialog", None)
+        if dialog is None:
+            # No configuration pinned: the dialog reads the window's current one, which a
+            # reload replaces while the modeless dialog stays open.
+            dialog = SessionGuardDialog(self.session_guard, parent=self)
+            # Kept so the modeless dialog is not garbage-collected while open.
+            self.session_guard_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def launch_swc_capture(self, widget=None, data=None) -> None:
         """Launch the SwC Poker Console & Replayer."""
         from fpdb_3_legacy.swc_poker_console import SwCPokerConsoleDialog
@@ -1216,6 +1251,11 @@ class fpdb(QMainWindow):
                     hero_aliases = values.get("hero_aliases")
                     if hero_aliases is not None:
                         self.config.set_hero_aliases(site_name, hero_aliases)
+
+            # Apply data source hero aliases (Data Sources tab, #423).
+            if hasattr(dia, "get_data_source_changes"):
+                for source_name, source_aliases in dia.get_data_source_changes().items():
+                    self.config.set_data_source_hero_aliases(source_name, source_aliases)
 
             # Apply multiroom hero profile changes (Hero Profiles tab).
             if hasattr(dia, "get_profile_changes"):

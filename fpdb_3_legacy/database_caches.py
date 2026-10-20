@@ -15,6 +15,15 @@ import pytz
 from fpdb_3_legacy.action_enum_stats import CACHE_KEYS as ACTION_ENUM_CACHE_KEYS
 from fpdb_3_legacy.loggingFpdb import get_logger
 
+# Positions in the Hands row storeHand queues in hbulk, which follows the column
+# order of the "store_hand" query: id, tableName, siteHandNo, tourneyId,
+# gametypeId, sessionId, ... When id was put first (734247d8) these were left
+# one short, so every hand imported with session caching on had its gametypeId
+# overwritten by its session id, its sessionId left empty, and Tourneys was
+# looked up by hand number (#592). test_database_caches.py pins them to the query.
+HANDS_ROW_TOURNEY_ID = 3
+HANDS_ROW_SESSION_ID = 5
+
 log = get_logger("db")
 
 CACHE_KEYS = [
@@ -475,6 +484,18 @@ class DatabaseCachesMixin:
 
         def insertOrUpdate(self, type: Any, cursor: Any, key: Any, select: Any, insert: Any) -> Any: ...
 
+    def hud_day_offset(self) -> timedelta:
+        """How far a hand's UTC start time is moved back before HudCache takes its day.
+
+        The machine's UTC offset and the configured day_start, so a hand is
+        bucketed into the player's own day. The cache rebuild applies the same
+        offset in SQL (#591); the two must agree or a rebuild moves the hands
+        played near midnight to another day.
+        """
+        tz = datetime.utcnow() - datetime.today()
+        tz_offset = round(tz.total_seconds() / 3600)
+        return timedelta(hours=self.day_start + tz_offset)
+
     def storeHudCache(self, gid, gametype, pids, starttime, pdata, doinsert=False) -> None:
         """Update cached statistics. If update fails because no record exists, do an insert."""
         if pdata:
@@ -482,12 +503,7 @@ class DatabaseCachesMixin:
             # day_start buckets it into the player's own day. timedelta.seconds
             # is unsigned, so east of UTC it used to report 21..23 hours instead
             # of a small negative and filed hands under the previous day.
-            tz = datetime.utcnow() - datetime.today()
-            tz_offset = round(tz.total_seconds() / 3600)
-            tz_day_start_offset = self.day_start + tz_offset
-
-            d = timedelta(hours=tz_day_start_offset)
-            starttime_offset = starttime - d
+            starttime_offset = starttime - self.hud_day_offset()
             styleKey = datetime.strftime(starttime_offset, "d%y%m%d")
             seats = len(pids)
 
@@ -1249,9 +1265,9 @@ class DatabaseCachesMixin:
     def appendHandsSessionIds(self) -> None:
         for i in range(len(self.hbulk)):
             hid = self.hids[i]
-            tid = self.hbulk[i][2]
+            tid = self.hbulk[i][HANDS_ROW_TOURNEY_ID]
             sc = self.s.get(hid)
             if sc is not None:
-                self.hbulk[i][4] = sc["id"]
+                self.hbulk[i][HANDS_ROW_SESSION_ID] = sc["id"]
                 if tid:
                     self.tbulk[tid] = sc["id"]

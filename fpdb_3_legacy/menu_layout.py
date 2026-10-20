@@ -107,6 +107,12 @@ def menu_layout() -> tuple[Menu, ...]:
                     "dia_import_pt4stat",
                     tip=N_("Import PokerTracker 4 custom statistics as declarative stat descriptors"),
                 ),
+                MenuItem(
+                    N_("Stat Packs"),
+                    "dia_stat_packs",
+                    tip=N_("Import, enable, disable, uninstall and export declarative stat packs"),
+                    separator_before=True,
+                ),
             ),
         ),
         Menu(
@@ -167,6 +173,11 @@ def menu_layout() -> tuple[Menu, ...]:
             N_("Tools"),
             (
                 MenuItem(N_("Auto Notes Workbench"), "tab_auto_notes_workbench"),
+                MenuItem(
+                    N_("Session Guard"),
+                    "dia_session_guard",
+                    tip=N_("Alerts for the session being played: loss, win, duration, hands, drawdown"),
+                ),
                 MenuItem(N_("Launch SwC HTTP Capture"), "launch_swc_capture"),
                 MenuItem(
                     N_("Logger Dev Tool"),
